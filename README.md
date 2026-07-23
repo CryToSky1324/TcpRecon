@@ -98,3 +98,5 @@ JSON
 Architecture
 
 For a deep dive into the engineering decisions, state table exhaustion physics, and the evolution of this project from Python threads to Go multiplexing, read the ARCHITECTURE.md document.
+# TcpRecon
+This is a custom-engineered, highly concurrent TCP port scanner and network reconnaissance engine written in Go.
