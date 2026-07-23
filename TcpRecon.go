@@ -1,32 +1,35 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-	"encoding/json"
+
 	"golang.org/x/time/rate"
 )
 
+// ScanResult structures our output for the main thread and JSON encoding
 type ScanResult struct {
 	Port        int      `json:"port"`
 	State       string   `json:"state"`
 	Banner      string   `json:"banner,omitempty"`
+	OSHint      string   `json:"os_hint,omitempty"`
 	CertSubject string   `json:"tls_subject,omitempty"`
 	CertIssuer  string   `json:"tls_issuer,omitempty"`
 	SANs        []string `json:"tls_sans,omitempty"`
 }
 
+// ScanReport encapsulates the entire execution telemetry for SIEM ingestion
 type ScanReport struct {
 	Target      string       `json:"target"`
 	TargetIP    string       `json:"target_ip"`
@@ -35,181 +38,238 @@ type ScanReport struct {
 	Ports       []ScanResult `json:"ports"`
 }
 
-func resolveTarget(target string) string {
-	ips, err := net.LookupIP(target)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL ERROR: Unable to resolve target '%s': %v\n", target, err)
-		os.Exit(1)
-	}
-
-	for _, ip := range ips {
-		if ipv4 := ip.To4(); ipv4 != nil {
-			return ipv4.String()
-		}
-	}
-
-	fmt.Fprintf(os.Stderr, "[!] FATAL ERROR: No IPv4 address found for target '%s'\n", target)
-	os.Exit(1)
-	return ""
+// ScanJob defines a single atomic scanning task across the dispatcher
+type ScanJob struct {
+	TargetIP   string
+	TargetName string
+	Port       int
 }
 
-func parsePorts(portStr string) []int {
-	var ports []int
-	seen := make(map[int]bool)
+// TargetMap links the raw input name/CIDR to its resolved IPv4 slices
+type TargetMap map[string][]string
 
-	parts := strings.Split(portStr, ",")
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part == "" {
+// expandCIDR mathematically generates usable IPv4 addresses from a CIDR block
+func expandCIDR(cidr string) ([]string, error) {
+	ip, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return nil, err
+	}
+
+	var ips []string
+	for ip := ip.Mask(ipnet.Mask); ipnet.Contains(ip); incIP(ip) {
+		ips = append(ips, ip.String())
+	}
+
+	// Filter out network and broadcast addresses for standard IPv4 subnets
+	if len(ips) > 2 {
+		return ips[1 : len(ips)-1], nil
+	}
+	return ips, nil
+}
+
+// incIP increments an IP address byte slice sequentially
+func incIP(ip net.IP) {
+	for j := len(ip) - 1; j >= 0; j-- {
+		ip[j]++
+		if ip[j] > 0 {
+			break
+		}
+	}
+}
+
+// ingestTargets processes a target text file line-by-line
+func ingestTargets(filePath string) TargetMap {
+	file, err := os.Open(filePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] FATAL ERROR: Cannot open target file: %v\n", err)
+		os.Exit(1)
+	}
+	defer file.Close()
+
+	targets := make(TargetMap)
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		if strings.Contains(part, "-") {
-			bounds := strings.Split(part, "-")
-			if len(bounds) != 2 {
-				fmt.Fprintf(os.Stderr, "[!] FATAL ERROR: Invalid port range format: %s\n", part)
-				os.Exit(1)
+		if strings.Contains(line, "/") {
+			ips, err := expandCIDR(line)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[!] Skipping invalid CIDR %s: %v\n", line, err)
+				continue
 			}
+			targets[line] = ips
+			continue
+		}
 
-			start, err1 := strconv.Atoi(bounds[0])
-			end, err2 := strconv.Atoi(bounds[1])
+		ips, err := net.LookupIP(line)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] Skipping unresolvable target %s: %v\n", line, err)
+			continue
+		}
 
-			if err1 != nil || err2 != nil || start > end || start < 1 || end > 65535 {
-				fmt.Fprintf(os.Stderr, "[!] FATAL ERROR: Invalid port boundaries: %s\n", part)
-				os.Exit(1)
+		var validIPs []string
+		for _, ip := range ips {
+			if ipv4 := ip.To4(); ipv4 != nil {
+				validIPs = append(validIPs, ipv4.String())
 			}
-
-			for p := start; p <= end; p++ {
-				if !seen[p] {
-					ports = append(ports, p)
-					seen[p] = true
-				}
-			}
-		} else {
-			p, err := strconv.Atoi(part)
-			if err != nil || p < 1 || p > 65535 {
-				fmt.Fprintf(os.Stderr, "[!] FATAL ERROR: Invalid port: %s\n", part)
-				os.Exit(1)
-			}
-			if !seen[p] {
-				ports = append(ports, p)
-				seen[p] = true
-			}
+		}
+		if len(validIPs) > 0 {
+			targets[line] = validIPs
 		}
 	}
 
-	if len(ports) == 0 {
-		fmt.Fprintln(os.Stderr, "[!] FATAL ERROR: No valid ports specified.")
-		os.Exit(1)
-	}
-
-	return ports
+	return targets
 }
 
-func worker(ctx context.Context, targetIP string, targetName string, jobs <-chan int, results chan<- ScanResult, timeout time.Duration, debug bool, limiter *rate.Limiter) {
+// parsePortRange parses comma-separated ports and ranges (e.g., "80,443,1000-1024")
+func parsePortRange(portStr string) ([]int, error) {
+	var ports []int
+	parts := strings.Split(portStr, ",")
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.Contains(part, "-") {
+			var start, end int
+			_, err := fmt.Sscanf(part, "%d-%d", &start, &end)
+			if err != nil {
+				return nil, fmt.Errorf("invalid port range syntax: %s", part)
+			}
+			for p := start; p <= end; p++ {
+				if p < 1 || p > 65535 {
+					return nil, fmt.Errorf("port out of range (1-65535): %d", p)
+				}
+				ports = append(ports, p)
+			}
+		} else {
+			var p int
+			_, err := fmt.Sscanf(part, "%d", &p)
+			if err != nil {
+				return nil, fmt.Errorf("invalid port syntax: %s", part)
+			}
+			if p < 1 || p > 65535 {
+				return nil, fmt.Errorf("port out of range (1-65535): %d", p)
+			}
+			ports = append(ports, p)
+		}
+	}
+	return ports, nil
+}
+
+// fingerprintOS analyzes application layer banners to deduce the underlying operating system
+func fingerprintOS(banner string) string {
+	if banner == "" {
+		return ""
+	}
+
+	normalized := strings.ToLower(banner)
+
+	if strings.Contains(normalized, "ubuntu") {
+		return "Ubuntu Linux"
+	}
+	if strings.Contains(normalized, "debian") {
+		return "Debian Linux"
+	}
+	if strings.Contains(normalized, "centos") {
+		return "CentOS Linux"
+	}
+	if strings.Contains(normalized, "freebsd") {
+		return "FreeBSD"
+	}
+	if strings.Contains(normalized, "windows") || strings.Contains(normalized, "iis") || strings.Contains(normalized, "win32") {
+		return "Microsoft Windows"
+	}
+
+	return "Unknown/Obfuscated"
+}
+
+// worker executes the TCP connection, TLS wrapping, payload injection, and X.509 extraction
+func worker(ctx context.Context, jobs <-chan ScanJob, results chan<- ScanResult, timeout time.Duration, debug bool, limiter *rate.Limiter) {
+	dialer := net.Dialer{Timeout: timeout}
+
 	for {
-		var port int
+		var job ScanJob
 		var ok bool
 		select {
 		case <-ctx.Done():
 			return
-		case port, ok = <-jobs:
+		case job, ok = <-jobs:
 			if !ok {
 				return
 			}
 		}
 
-		// Token Bucket Throttle
 		if err := limiter.Wait(ctx); err != nil {
 			return
 		}
 
-		address := fmt.Sprintf("%s:%d", targetIP, port)
-
-		// Layer 4: Context-Aware TCP Handshake
-		var d net.Dialer
-		dialCtx, cancelDial := context.WithTimeout(ctx, timeout)
-		conn, err := d.DialContext(dialCtx, "tcp", address)
-		cancelDial()
-
+		address := fmt.Sprintf("%s:%d", job.TargetIP, job.Port)
+		conn, err := dialer.DialContext(ctx, "tcp", address)
 		if err != nil {
-			if debug && err != context.Canceled {
-				log.Printf("[DEBUG] Port %d Layer 4 Drop: %v", port, err)
+			if debug {
+				fmt.Fprintf(os.Stderr, "[DEBUG] Dial failed for %s: %v\n", address, err)
 			}
-			results <- ScanResult{Port: port, State: "CLOSED"}
 			continue
 		}
 
-		banner := ""
-		activeConn := conn
-
-		// Layer 6: TLS Wrapping
-		// Declare variables to hold the extracted X.509 telemetry
+		var activeConn net.Conn = conn
 		var certSubject, certIssuer string
 		var sans []string
 
-		if port == 443 || port == 8443 {
+		// Layer 6: TLS Wrapping for HTTPS / secure endpoints with SNI Injection
+		if job.Port == 443 || job.Port == 8443 {
 			tlsConfig := &tls.Config{
 				InsecureSkipVerify: true,
-				ServerName: 	targetName,
+				ServerName:         job.TargetName,
 			}
 			tlsConn := tls.Client(conn, tlsConfig)
-
+			
+			// Set explicit handshake deadline to prevent hanging workers
 			tlsConn.SetDeadline(time.Now().Add(timeout))
-			err = tlsConn.Handshake()
-			if err != nil {
-				conn.Close()
-				results <- ScanResult{
-					Port: port, State: "OPEN", Banner: fmt.Sprintf("TLS Handshake Failed: %v", err),
+			if err := tlsConn.Handshake(); err == nil {
+				activeConn = tlsConn
+				state := tlsConn.ConnectionState()
+				if len(state.PeerCertificates) > 0 {
+					cert := state.PeerCertificates[0]
+					certSubject = cert.Subject.CommonName
+					if len(cert.Issuer.Organization) > 0 {
+						certIssuer = cert.Issuer.Organization[0]
+					}
+					sans = cert.DNSNames
 				}
+			} else {
+				if debug {
+					fmt.Fprintf(os.Stderr, "[DEBUG] TLS handshake failed for %s: %v\n", address, err)
+				}
+				conn.Close()
 				continue
 			}
-			activeConn = tlsConn
-
-			// NEW: X.509 Cryptographic Extraction
-			// The Handshake populated the ConnectionState. We extract the leaf certificate [0].
-			state := tlsConn.ConnectionState()
-			if len(state.PeerCertificates) > 0 {
-				cert := state.PeerCertificates[0]
-				certSubject = cert.Subject.CommonName
-				certIssuer = cert.Issuer.CommonName
-				sans = cert.DNSNames // Subject Alternative Names
-			}
-		}
-	
-
-		// Layer 7: Dynamic Payload Injection
-		var payload []byte
-		if port == 80 || port == 8080 || port == 443 || port == 8443 {
-			payload = []byte(fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n", targetIP))
 		}
 
-		if payload != nil {
-			activeConn.SetWriteDeadline(time.Now().Add(timeout))
-			activeConn.Write(payload)
+		// Layer 7: Application-Layer Payload Injection
+		activeConn.SetWriteDeadline(time.Now().Add(timeout))
+		if job.Port == 80 || job.Port == 8080 {
+			httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", job.TargetIP)
+			activeConn.Write([]byte(httpReq))
 		}
 
-		// Banner Grabbing & Strict Error Handling
+		// Banner Grabbing / Read Buffer
 		activeConn.SetReadDeadline(time.Now().Add(timeout))
 		buf := make([]byte, 1024)
-		n, err := activeConn.Read(buf)
+		n, _ := activeConn.Read(buf)
+		banner := string(buf[:n])
 
-		if n > 0 {
-			banner = string(buf[:n])
-			banner = strings.ReplaceAll(banner, "\r", "")
-			banner = strings.ReplaceAll(banner, "\n", " ")
-			if len(banner) > 150 {
-				banner = banner[:150] + " [...]"
-			}
-		} else if err != nil && err != context.Canceled {
-			banner = fmt.Sprintf("Read Error: %v", err)
-		}
+		osHint := fingerprintOS(banner)
 
 		activeConn.Close()
 		results <- ScanResult{
-			Port:        port,
+			Port:        job.Port,
 			State:       "OPEN",
 			Banner:      strings.TrimSpace(banner),
+			OSHint:      osHint,
 			CertSubject: certSubject,
 			CertIssuer:  certIssuer,
 			SANs:        sans,
@@ -218,86 +278,133 @@ func worker(ctx context.Context, targetIP string, targetName string, jobs <-chan
 }
 
 func main() {
-	// 1. CLI Parsing
+	// CLI Flag Definitions
 	workersPtr := flag.Int("w", 500, "Maximum number of concurrent Goroutine workers")
 	timeoutPtr := flag.Int("t", 1000, "Timeout per port in milliseconds")
 	portsPtr := flag.String("p", "1-1000", "Ports to scan (e.g., 80,443,1-1024)")
-	debugPtr := flag.Bool("d", false, "Enable debug mode to log Layer 4 socket errors to stderr")
 	ratePtr := flag.Int("r", 100, "Global rate limit in packets per second (PPS)")
+	inputListPtr := flag.String("iL", "", "Input file containing list of targets/CIDRs")
+	debugPtr := flag.Bool("d", false, "Enable debug mode to log Layer 4 socket errors to stderr")
 	jsonPtr := flag.Bool("j", false, "Output results strictly in JSON format (mutes stdout text)")
 
 	flag.Parse()
 
-	args := flag.Args()
-	if len(args) < 1 {
-		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <target>\n", os.Args[0])
-		flag.PrintDefaults()
+	numWorkers := *workersPtr
+	timeout := time.Duration(*timeoutPtr) * time.Millisecond
+	debugMode := *debugPtr
+	jsonMode := *jsonPtr
+
+	// Parse Port Range Specification
+	portsToScan, err := parsePortRange(*portsPtr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] FATAL: %v\n", err)
 		os.Exit(1)
 	}
 
-	rawTarget := args[0]
-	targetIP := resolveTarget(rawTarget)
-	numWorkers := *workersPtr
-	timeout := time.Duration(*timeoutPtr) * time.Millisecond
-	portsToScan := parsePorts(*portsPtr)
-	debugMode := *debugPtr
+	// Target Resolution & Ingestion
+	targetList := make(TargetMap)
 
-	// 2. Lifecycle Management
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	if *inputListPtr != "" {
+		targetList = ingestTargets(*inputListPtr)
+	} else {
+		rawTarget := flag.Arg(0)
+		if rawTarget == "" {
+			fmt.Fprintf(os.Stderr, "[!] FATAL: You must specify a target or an input file (-iL)\n")
+			os.Exit(1)
+		}
+
+		ips, err := net.LookupIP(rawTarget)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot resolve target %s: %v\n", rawTarget, err)
+			os.Exit(1)
+		}
+
+		var validIPs []string
+		for _, ip := range ips {
+			if ipv4 := ip.To4(); ipv4 != nil {
+				validIPs = append(validIPs, ipv4.String())
+			}
+		}
+
+		if len(validIPs) == 0 {
+			fmt.Fprintf(os.Stderr, "[!] FATAL: No IPv4 addresses found for %s\n", rawTarget)
+			os.Exit(1)
+		}
+		targetList[rawTarget] = validIPs
+	}
+
+	if len(targetList) == 0 {
+		fmt.Fprintf(os.Stderr, "[!] FATAL: No valid targets loaded for scanning.\n")
+		os.Exit(1)
+	}
+
+	// Context Cancellation & Signal Interception (SIGINT)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 3. Global Rate Limiter
-	globalLimiter := rate.NewLimiter(rate.Limit(*ratePtr), 1)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Fprintln(os.Stderr, "\n[!] Aborting scan gracefully... Shutting down workers.")
+		cancel()
+	}()
 
-	// 4. Dispatcher Initialization
-	// Extract JSON flag
-	jsonMode := *jsonPtr
+	// Token Bucket Rate Limiter
+	globalLimiter := rate.NewLimiter(rate.Limit(*ratePtr), *ratePtr)
 
-	// 4. Dispatcher Initialization
-	jobs := make(chan int, numWorkers)
+	// Dispatcher Initialization
+	jobs := make(chan ScanJob, numWorkers)
 	results := make(chan ScanResult)
 	var wg sync.WaitGroup
 
-	// STRICT STREAM DISCIPLINE: 
-	// If in JSON mode, we MUST send human updates to os.Stderr to prevent JSON corruption.
+	totalIPs := 0
+	for _, ips := range targetList {
+		totalIPs += len(ips)
+	}
+
 	if !jsonMode {
-		fmt.Printf("[*] Target '%s' resolved to IPv4: %s\n", rawTarget, targetIP)
+		fmt.Printf("[*] Loaded targets resolving to %d unique IPv4 addresses\n", totalIPs)
 		fmt.Printf("[*] Initiating scan against %d ports with %d Goroutines...\n", len(portsToScan), numWorkers)
 		fmt.Printf("[*] Engine Throttled at %d PPS (Timeout: %s)\n", *ratePtr, timeout)
 	} else {
-		fmt.Fprintf(os.Stderr, "[*] Scanning %s (%s) at %d PPS...\n", rawTarget, targetIP, *ratePtr)
+		fmt.Fprintf(os.Stderr, "[*] Scanning %d IPs at %d PPS...\n", totalIPs, *ratePtr)
 	}
-	
+
 	startTime := time.Now()
 
-	// 5. Spawn Worker Pool
+	// Spawn Worker Pool
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			worker(ctx, targetIP, rawTarget, jobs, results, timeout, debugMode, globalLimiter)
+			worker(ctx, jobs, results, timeout, debugMode, globalLimiter)
 		}()
 	}
 
-	// 6. Job Producer
+	// Job Producer
 	go func() {
 		defer close(jobs)
-		for _, port := range portsToScan {
-			select {
-			case <-ctx.Done():
-				return
-			case jobs <- port:
+		for rawName, resolvedIPs := range targetList {
+			for _, ip := range resolvedIPs {
+				for _, port := range portsToScan {
+					select {
+					case <-ctx.Done():
+						return
+					case jobs <- ScanJob{TargetIP: ip, TargetName: rawName, Port: port}:
+					}
+				}
 			}
 		}
 	}()
 
-	// 7. Lifecycle Monitor
+	// Lifecycle Monitor
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
 
-	// 8. Result Consumer
+	// Result Consumer
 	var discoveredPorts []ScanResult
 	openPorts := 0
 
@@ -306,14 +413,17 @@ func main() {
 			discoveredPorts = append(discoveredPorts, result)
 			openPorts++
 
-			// Only print to terminal if we are NOT in JSON mode
 			if !jsonMode {
 				bannerDisplay := "No Banner"
 				if result.Banner != "" {
 					bannerDisplay = result.Banner
 				}
 				fmt.Printf("[+] Port %d/TCP is OPEN\t- %s\n", result.Port, bannerDisplay)
-				
+
+				if result.OSHint != "" && result.OSHint != "Unknown/Obfuscated" {
+					fmt.Printf("    |_ OS Fingerprint: %s\n", result.OSHint)
+				}
+
 				if result.CertSubject != "" {
 					fmt.Printf("    |_ TLS Subject: %s\n", result.CertSubject)
 					fmt.Printf("    |_ TLS Issuer:  %s\n", result.CertIssuer)
@@ -327,23 +437,21 @@ func main() {
 
 	duration := time.Since(startTime)
 
-	// 9. Final Output Generation
+	// Final Output Generation
 	if jsonMode {
 		report := ScanReport{
-			Target:      rawTarget,
-			TargetIP:    targetIP,
+			Target:      "multi-target-sweep",
+			TargetIP:    "multiple",
 			DurationSec: duration.Seconds(),
 			TotalOpen:   openPorts,
 			Ports:       discoveredPorts,
 		}
 
-		// Marshal into beautifully formatted JSON
 		jsonData, err := json.MarshalIndent(report, "", "  ")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[!] JSON Encoding Error: %v\n", err)
 			os.Exit(1)
 		}
-		// Write exactly one clean JSON object to standard output
 		fmt.Println(string(jsonData))
 	} else {
 		fmt.Printf("[*] Scan completed in %.2f seconds. Discovered %d open ports.\n", duration.Seconds(), openPorts)
