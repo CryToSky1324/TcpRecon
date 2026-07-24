@@ -1,30 +1,62 @@
 # ==========================================
-# STAGE 1: Build the statically linked binary
+# STAGE 1: The Builder (OS & Compilation Environment)
 # ==========================================
-FROM golang:1.25-alpine AS builder
+FROM golang:1.24-alpine AS builder
 
-WORKDIR /build
+# 1. Update OS dependencies for cryptographic trust and temporal accuracy
+RUN apk update && apk add --no-cache git ca-certificates tzdata && update-ca-certificates
 
-# Install git or build essentials if needed for dependencies
-RUN apk add --no-cache git
+# 2. Provision an unprivileged user space (Namespace Isolation)
+# Creating a dedicated user with UID 10001 to pass into the scratch container.
+ENV USER=recon
+ENV UID=10001
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    "${USER}"
 
-# Copy dependency tracking files first for optimized caching
+WORKDIR /src
+
+# 3. Layer Caching: Dependency tracking
 COPY go.mod go.sum ./
-RUN go mod download
+RUN go mod download && go mod verify
 
-# Copy the source code
-COPY TcpRecon.go .
+# 4. Ingest the refactored project tree
+COPY cmd/ cmd/
+COPY internal/ internal/
 
-# Compile a 100% static binary (disabling CGO)
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o TcpRecon TcpRecon.go
+# 5. Compile the deterministic static binary
+# - CGO_ENABLED=0: Force static compilation (eliminate libc dependencies)
+# - -w -s: Strip DWARF debugging information and symbol table 
+# - -extldflags '-static': Force external linker to emit a fully static binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -a -tags netgo -ldflags="-w -s -extldflags '-static'" \
+    -o /go/bin/tcprecon cmd/tcprecon/main.go
 
 # ==========================================
-# STAGE 2: Assemble the minimalist scratch container
+# STAGE 2: The Void (Zero-Attack-Surface Execution)
 # ==========================================
 FROM scratch
 
-# Copy the compiled binary from the builder stage
-COPY --from=builder /build/TcpRecon /TcpRecon
+# 1. Import the cryptographic trust chain (Resolves X.509/TLS blindness)
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
-# Define the default entrypoint executable
-ENTRYPOINT ["/TcpRecon"]
+# 2. Import timezone data (Mandatory for deterministic JSON log timestamps)
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+
+# 3. Import namespace mapping (Resolves UID 0 violation)
+COPY --from=builder /etc/passwd /etc/passwd
+COPY --from=builder /etc/group /etc/group
+
+# 4. Import the compiled binary
+COPY --from=builder /go/bin/tcprecon /bin/tcprecon
+
+# 5. Enforce unprivileged execution boundaries
+USER recon:recon
+
+# 6. Execute
+ENTRYPOINT ["/bin/tcprecon"]
