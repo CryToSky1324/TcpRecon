@@ -1,0 +1,72 @@
+name: TCPRecon CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  GO_VERSION: '1.22'
+
+jobs:
+  lint-and-validate:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true # Enforces aggressive dependency caching
+
+      - name: Verify Dependencies
+        run: go mod verify
+
+      - name: Strict GolangCI-Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+          # Fails the pipeline immediately if linting standards are violated
+
+      - name: Execute Unit Tests
+        run: go test -v -race ./...
+
+  compile-and-package:
+    name: Build Release Binaries
+    needs: lint-and-validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Deterministic Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0 # Enforces static compilation
+        run: |
+          mkdir -p bin
+          go build -ldflags="-w -s" -o bin/tcprecon-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/tcprecon/main.go
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tcprecon-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: bin/tcprecon-${{ matrix.goos }}-${{ matrix.goarch }}
+          retention-days: 7
