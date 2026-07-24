@@ -11,7 +11,7 @@ import (
 
 	"golang.org/x/time/rate"
 
-	"github.com/CryToSky1324/TcpRecon/internal/models" // Adjust to your canonical go.mod module path
+	"github.com/CryToSky1324/TcpRecon/internal/models"
 	"github.com/CryToSky1324/TcpRecon/internal/utils"
 )
 
@@ -45,11 +45,13 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 			if debug {
 				fmt.Fprintf(os.Stderr, "[DEBUG] Dial failed for %s: %v\n", address, err)
 			}
+			// L4 failed. Port is closed/filtered. Move to next job.
 			continue
 		}
 
+		// L4 Succeeded. We MUST push a result for this port regardless of L7 success.
 		var activeConn net.Conn = conn
-		var certSubject, certIssuer string
+		var certSubject, certIssuer, banner string
 		var sans []string
 
 		// 4. Layer 6: TLS Wrapping with SNI Injection
@@ -60,39 +62,46 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 			}
 			tlsConn := tls.Client(conn, tlsConfig)
 			
-			tlsConn.SetDeadline(time.Now().Add(timeout))
-			if err := tlsConn.Handshake(); err == nil {
-				activeConn = tlsConn
-				state := tlsConn.ConnectionState()
-				if len(state.PeerCertificates) > 0 {
-					cert := state.PeerCertificates[0]
-					certSubject = cert.Subject.CommonName
-					if len(cert.Issuer.Organization) > 0 {
-						certIssuer = cert.Issuer.Organization[0]
+			// Trap deadline failure
+			if err := tlsConn.SetDeadline(time.Now().Add(timeout)); err == nil {
+				if err := tlsConn.Handshake(); err == nil {
+					activeConn = tlsConn
+					state := tlsConn.ConnectionState()
+					if len(state.PeerCertificates) > 0 {
+						cert := state.PeerCertificates[0]
+						certSubject = cert.Subject.CommonName
+						if len(cert.Issuer.Organization) > 0 {
+							certIssuer = cert.Issuer.Organization[0]
+						}
+						sans = cert.DNSNames
 					}
-					sans = cert.DNSNames
-				}
-			} else {
-				if debug {
+				} else if debug {
 					fmt.Fprintf(os.Stderr, "[DEBUG] TLS handshake failed for %s: %v\n", address, err)
 				}
-				conn.Close()
-				continue
 			}
 		}
 
 		// 5. Layer 7: Application-Layer Payload Injection
-		activeConn.SetWriteDeadline(time.Now().Add(timeout))
-		if job.Port == 80 || job.Port == 8080 {
-			httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", job.TargetIP)
-			activeConn.Write([]byte(httpReq))
+		// Trap WriteDeadline failure
+		if err := activeConn.SetWriteDeadline(time.Now().Add(timeout)); err == nil {
+			if job.Port == 80 || job.Port == 8080 {
+				httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", job.TargetIP)
+				// Trap payload transmission failure
+				if _, err := activeConn.Write([]byte(httpReq)); err != nil && debug {
+					fmt.Fprintf(os.Stderr, "[DEBUG] HTTP Write failed for %s: %v\n", address, err)
+				}
+			}
 		}
 
 		// 6. Buffer Allocation and Banner Extraction
-		activeConn.SetReadDeadline(time.Now().Add(timeout))
-		buf := make([]byte, 1024)
-		n, _ := activeConn.Read(buf)
-		banner := string(buf[:n])
+		// Trap ReadDeadline failure
+		if err := activeConn.SetReadDeadline(time.Now().Add(timeout)); err == nil {
+			buf := make([]byte, 1024)
+			// Trap Read failure (EOF or timeouts are common, don't panic)
+			if n, err := activeConn.Read(buf); err == nil && n > 0 {
+				banner = string(buf[:n])
+			}
+		}
 
 		// 7. Stateless OS Fingerprinting Execution
 		osHint := utils.FingerprintOS(banner)

@@ -7,7 +7,7 @@ on:
     branches: [ "main" ]
 
 env:
-  GO_VERSION: '1.25'
+  GO_VERSION: '1.24'
 
 jobs:
   lint-and-validate:
@@ -32,7 +32,7 @@ jobs:
           ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
         with:
           version: latest
-          args: --timeout=5m --go=1.24
+          args: --timeout=5m 
           # Fails the pipeline immediately if linting standards are violated
 
       - name: Execute Unit Tests
