@@ -1,4 +1,4 @@
-module custom-scanner
+module github.com/CryToSky1324/TcpRecon
 
 go 1.25.0
 
