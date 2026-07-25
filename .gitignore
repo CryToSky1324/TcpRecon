@@ -1,5 +1,5 @@
 # 1. Compiled Go Binaries
-tcprecon
+./tcprecon
 *.exe
 *.out
 *.test
@@ -9,3 +9,4 @@ targets.txt
 *.csv
 
 *.json
+*.db

@@ -2,9 +2,6 @@ package scanner
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
-	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +11,7 @@ import (
 )
 
 // Run orchestrates the Thread Pool, Channel Pipelines, and WaitGroups
-func Run(ctx context.Context, targetList models.TargetMap, portsToScan []int, numWorkers int, timeout time.Duration, rateLimit int, debugMode bool, jsonMode bool) (int, time.Duration) {
+func Run(ctx context.Context, targetList models.TargetMap, portsToScan []int, numWorkers int, timeout time.Duration, rateLimit int, debugMode bool, jsonMode bool) (<-chan models.ScanResult, time.Time) {
 	// Token Bucket Rate Limiter
 	globalLimiter := rate.NewLimiter(rate.Limit(rateLimit), rateLimit)
 
@@ -55,47 +52,7 @@ func Run(ctx context.Context, targetList models.TargetMap, portsToScan []int, nu
 		close(results)
 	}()
 
-	// Result Consumer
-	openPorts := 0
-
-	for result := range results {
-		if result.State == "OPEN" {
-			openPorts++
-
-			if jsonMode {
-				// 12-Factor Compliance: Atomic JSON Emission
-				slog.Info("open_port_detected",
-					slog.String("target", result.TargetName),
-					slog.String("ip", result.TargetIP),
-					slog.Int("port", result.Port),
-					slog.String("status", result.State),
-					slog.String("banner", result.Banner),
-					slog.String("tls_subject", result.CertSubject),
-					slog.String("tls_issuer", result.CertIssuer),
-					slog.Any("tls_sans", result.SANs),
-				)
-			} else {
-				bannerDisplay := "No Banner"
-				if result.Banner != "" {
-					bannerDisplay = result.Banner
-				}
-				fmt.Printf("[+] Port %d/TCP is OPEN\t- %s\n", result.Port, bannerDisplay)
-
-				if result.OSHint != "" && result.OSHint != "Unknown/Obfuscated" {
-					fmt.Printf("    |_ OS Fingerprint: %s\n", result.OSHint)
-				}
-
-				if result.CertSubject != "" {
-					fmt.Printf("    |_ TLS Subject: %s\n", result.CertSubject)
-					fmt.Printf("    |_ TLS Issuer:  %s\n", result.CertIssuer)
-					if len(result.SANs) > 0 {
-						fmt.Printf("    |_ TLS SANs:    %s\n", strings.Join(result.SANs, ", "))
-					}
-				}
-			}
-		}
-	}
-
-	duration := time.Since(startTime)
-	return openPorts, duration
+	// Delegate consumption to the State Manager (Requires db pointer passed into Run, or handled in main)
+	// We will return the channel to main.go so main can own the DB lifecycle.
+	return results, startTime
 }

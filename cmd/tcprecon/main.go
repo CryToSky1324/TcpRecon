@@ -15,6 +15,8 @@ import (
 	"github.com/CryToSky1324/TcpRecon/internal/models"
 	"github.com/CryToSky1324/TcpRecon/internal/scanner"
 	"github.com/CryToSky1324/TcpRecon/internal/utils"
+
+	"go.etcd.io/bbolt"
 )
 
 func main() {
@@ -111,10 +113,31 @@ func main() {
 		cancel()
 	}()
 
-	// 5. Engine Invocation
-	openPorts, duration := scanner.Run(ctx, targetList, portsToScan, numWorkers, timeout, *ratePtr, debugMode, jsonMode)
+	// 4.5 Initialize State Store (Mapped to K8s PVC)
+	dbPath := "./asm_state.db" // Must be mounted via Docker/K8s, ./asm_state.db for local testing
+	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to acquire DB lock. Is another instance running? %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
 
-	// 6. JSON Rendering & Stream Discipline
+	err = db.Update(func(tx *bbolt.Tx) error {
+		_, err := tx.CreateBucketIfNotExists([]byte("PortStates"))
+		return err
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to initialize bucket: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 5. Engine Invocation
+	resultsChan, startTime := scanner.Run(ctx, targetList, portsToScan, numWorkers, timeout, *ratePtr, debugMode, jsonMode)
+
+	// 6. State Manager Execution
+	openPorts := scanner.StateManager(db, resultsChan, jsonMode)
+	duration := time.Since(startTime)
+
 	if !jsonMode {
 		fmt.Fprintf(os.Stderr, "[*] Scan completed in %.2f seconds. Discovered %d open ports.\n", duration.Seconds(), openPorts)
 	}
