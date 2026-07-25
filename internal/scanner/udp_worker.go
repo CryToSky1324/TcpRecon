@@ -41,23 +41,32 @@ func UDPWorker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- m
 		}
 
 		// 1. Force the application to respond
-		conn.SetWriteDeadline(time.Now().Add(timeout))
+		if err := conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+			conn.Close()
+			continue
+		}
+		
 		if _, err := conn.Write(payload); err != nil {
 			conn.Close()
 			continue
 		}
 
-		// 2. Strict Read Deadline (The Anti-OOMKill pattern)
-		conn.SetReadDeadline(time.Now().Add(timeout))
+		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			conn.Close()
+			continue
+		}
+
+		// Allocate memory and pull the payload from the socket buffer
 		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
 		
 		state := "FILTERED"
 		banner := ""
 
+		// If we successfully read bytes before the deadline, the port is OPEN
 		if err == nil && n > 0 {
 			state = "OPEN"
-			// Sanitize raw bytes to prevent JSON marshaller panics
+			// Sanitize raw bytes to hex to prevent JSON marshaller panics
 			banner = fmt.Sprintf("%x", buf[:n]) 
 		}
 
