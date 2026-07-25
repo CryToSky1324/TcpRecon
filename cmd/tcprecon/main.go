@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -33,6 +33,14 @@ func main() {
 	timeout := time.Duration(*timeoutPtr) * time.Millisecond
 	debugMode := *debugPtr
 	jsonMode := *jsonPtr
+
+	// 12-Factor stream segregation: Lock structured logs to stdout
+	if jsonMode {
+		jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelInfo,
+		})
+		slog.SetDefault(slog.New(jsonHandler))
+	}
 
 	// 2. Stateless Parsing
 	portsToScan, err := utils.ParsePortRange(*portsPtr)
@@ -104,26 +112,10 @@ func main() {
 	}()
 
 	// 5. Engine Invocation
-	discoveredPorts, openPorts, duration := scanner.Run(ctx, targetList, portsToScan, numWorkers, timeout, *ratePtr, debugMode, jsonMode)
+	openPorts, duration := scanner.Run(ctx, targetList, portsToScan, numWorkers, timeout, *ratePtr, debugMode, jsonMode)
 
 	// 6. JSON Rendering & Stream Discipline
-	if jsonMode {
-		report := models.ScanReport{
-			Target:      "multi-target-sweep",
-			TargetIP:    "multiple",
-			DurationSec: duration.Seconds(),
-			TotalOpen:   openPorts,
-			Ports:       discoveredPorts,
-		}
-
-		jsonData, err := json.MarshalIndent(report, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] JSON Encoding Error: %v\n", err)
-			os.Exit(1)
-		}
-		// PRISTINE JSON TO STDOUT
-		fmt.Println(string(jsonData))
-	} else {
+	if !jsonMode {
 		fmt.Fprintf(os.Stderr, "[*] Scan completed in %.2f seconds. Discovered %d open ports.\n", duration.Seconds(), openPorts)
 	}
 }

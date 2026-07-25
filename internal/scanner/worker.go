@@ -22,7 +22,7 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 	for {
 		var job models.ScanJob
 		var ok bool
-		
+
 		// 1. Context-Aware Job Consumption
 		select {
 		case <-ctx.Done():
@@ -61,7 +61,7 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 				ServerName:         job.TargetName,
 			}
 			tlsConn := tls.Client(conn, tlsConfig)
-			
+
 			// Trap deadline failure
 			if err := tlsConn.SetDeadline(time.Now().Add(timeout)); err == nil {
 				if err := tlsConn.Handshake(); err == nil {
@@ -109,6 +109,8 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 		// 8. Graceful Teardown and Channel Push
 		activeConn.Close()
 		results <- models.ScanResult{
+			TargetName:  job.TargetName,
+			TargetIP:    job.TargetIP,
 			Port:        job.Port,
 			State:       "OPEN",
 			Banner:      strings.TrimSpace(banner),

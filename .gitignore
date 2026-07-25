@@ -1,5 +1,5 @@
 # 1. Compiled Go Binaries
-TcpRecon
+tcprecon
 *.exe
 *.out
 *.test
@@ -7,3 +7,5 @@ TcpRecon
 # 2. Target Lists & Operational Data
 targets.txt
 *.csv
+
+*.json
