@@ -21,7 +21,8 @@ import (
 func main() {
 	workersPtr := flag.Int("w", 500, "Maximum number of concurrent Goroutine workers")
 	timeoutPtr := flag.Int("t", 1000, "Timeout per port in milliseconds")
-	portsPtr := flag.String("p", "1-1000", "Ports to scan")
+	portsPtr := flag.String("p", "1-1000", "TCP Ports to scan")
+	udpPortsPtr := flag.String("uP", "", "UDP Ports to scan (e.g., 53,123,161)")
 	ratePtr := flag.Int("r", 100, "Global rate limit in packets per second (PPS)")
 	inputListPtr := flag.String("iL", "", "Input file containing list of targets/CIDRs")
 	debugPtr := flag.Bool("d", false, "Enable debug mode")
@@ -34,11 +35,20 @@ func main() {
 		slog.SetDefault(slog.New(jsonHandler))
 	}
 
-	portsToScan, err := utils.ParsePortRange(*portsPtr)
+	tcpPortsToScan, err := utils.ParsePortRange(*portsPtr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] FATAL: %v\n", err)
 		os.Exit(1)
 	}
+
+	var udpPortsToScan []int
+    if *udpPortsPtr != "" {
+        udpPortsToScan, err = utils.ParsePortRange(*udpPortsPtr)
+        if err != nil {
+            fmt.Fprintf(os.Stderr, "[!] FATAL UDP Port syntax: %v\n", err)
+            os.Exit(1)
+        }
+    }
 
 	// 1. Context Management (Moved up for HTTP Fetcher)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -53,34 +63,38 @@ func main() {
 	}()
 
 	// 2. Dynamic Stream Routing (K8s Env vs Local CLI)
-	var targetStream io.ReadCloser
-	targetURL := os.Getenv("TARGET_URL")
+	var targetStream io.Reader
 
-	if targetURL != "" {
-		targetStream, err = utils.FetchTargets(ctx, targetURL)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to stream targets from URL: %v\n", err)
-			os.Exit(1)
-		}
+	// 1. Check for POSIX stdin pipe (fd 0)
+	stat, _ := os.Stdin.Stat()
+	if (stat.Mode() & os.ModeCharDevice) == 0 {
+		targetStream = os.Stdin
 	} else if *inputListPtr != "" {
-		targetStream, err = os.Open(*inputListPtr)
+		// 2. Check for input file list
+		file, err := os.Open(*inputListPtr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open input file: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open target file: %v\n", err)
 			os.Exit(1)
 		}
+		// Defer the close against the concrete *os.File struct, not the io.Reader interface
+		defer file.Close()
+		targetStream = file
+	} else if targetEnv := os.Getenv("TARGET_URL"); targetEnv != "" {
+		// 3. Check for Environment Variable
+		targetStream = strings.NewReader(targetEnv)
+	} else if len(flag.Args()) > 0 {
+		// 4. Check for positional CLI argument
+		targetStream = strings.NewReader(flag.Arg(0))
 	} else {
-		rawTarget := flag.Arg(0)
-		if rawTarget == "" {
-			fmt.Fprintf(os.Stderr, "[!] FATAL: Specify a target, -iL, or TARGET_URL env var\n")
-			os.Exit(1)
-		}
-		targetStream = io.NopCloser(strings.NewReader(rawTarget))
+		// 5. Fail fast if no valid stream source exists
+		fmt.Fprintf(os.Stderr, "[!] FATAL: Specify a target, -iL, use stdin pipe, or TARGET_URL env var\n")
+		os.Exit(1)
 	}
-	defer targetStream.Close()
 
 	if !*jsonPtr {
-		fmt.Fprintf(os.Stderr, "[*] Initiating stream scan against %d ports with %d Goroutines...\n", len(portsToScan), *workersPtr)
-	}
+		totalPorts := len(tcpPortsToScan) + len(udpPortsToScan)
+		fmt.Fprintf(os.Stderr, "[*] Initiating stream scan against %d ports (%d TCP, %d UDP) with %d Goroutines...\n", totalPorts, len(tcpPortsToScan), len(udpPortsToScan), *workersPtr)
+    }
 
 	// 3. State Store Initialization
 	dbPath := os.Getenv("DB_PATH")
@@ -106,7 +120,7 @@ func main() {
 	}
 
 	// 4. Engine Invocation (Passing the io.Reader)
-	resultsChan, startTime := scanner.Run(ctx, targetStream, portsToScan, *workersPtr, time.Duration(*timeoutPtr)*time.Millisecond, *ratePtr, *debugPtr, *jsonPtr)
+	resultsChan, startTime := scanner.Run(ctx, targetStream, tcpPortsToScan, udpPortsToScan, *workersPtr, time.Duration(*timeoutPtr)*time.Millisecond, *ratePtr, *debugPtr, *jsonPtr)
 
 	// 5. State Manager Execution
 	openPorts := scanner.StateManager(db, resultsChan, *jsonPtr)

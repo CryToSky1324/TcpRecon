@@ -5,6 +5,7 @@ type ScanResult struct {
 	TargetName  string   `json:"target"`
 	TargetIP    string   `json:"ip"`
 	Port        int      `json:"port"`
+	Protocol    string   `json:"protocol"`
 	State       string   `json:"state"`
 	Banner      string   `json:"banner,omitempty"`
 	OSHint      string   `json:"os_hint,omitempty"`
@@ -18,7 +19,6 @@ type ScanJob struct {
 	TargetIP   string
 	TargetName string
 	Port       int
+	Protocol   string
 }
 
-// TargetMap links the raw input name/CIDR to its resolved IPv4 slices
-type TargetMap map[string][]string

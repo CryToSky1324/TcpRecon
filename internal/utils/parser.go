@@ -35,7 +35,7 @@ func FetchTargets(ctx context.Context, targetURL string) (io.ReadCloser, error) 
 }
 
 // StreamTargets reads line-by-line, preventing heap exhaustion, and feeds the worker channel.
-func StreamTargets(ctx context.Context, r io.Reader, ports []int, jobs chan<- models.ScanJob) {
+func StreamTargets(ctx context.Context, r io.Reader, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -49,13 +49,7 @@ func StreamTargets(ctx context.Context, r io.Reader, ports []int, jobs chan<- mo
 				continue
 			}
 			for _, ip := range ips {
-				for _, port := range ports {
-					select {
-					case <-ctx.Done():
-						return
-					case jobs <- models.ScanJob{TargetIP: ip, TargetName: line, Port: port}:
-					}
-				}
+				dispatchJobs(ctx, ip, line, tcpPorts, udpPorts, rawJobs)
 			}
 			continue
 		}
@@ -66,14 +60,29 @@ func StreamTargets(ctx context.Context, r io.Reader, ports []int, jobs chan<- mo
 		}
 		for _, ip := range ips {
 			if ipv4 := ip.To4(); ipv4 != nil {
-				for _, port := range ports {
-					select {
-					case <-ctx.Done():
-						return
-					case jobs <- models.ScanJob{TargetIP: ipv4.String(), TargetName: line, Port: port}:
-					}
-				}
+				dispatchJobs(ctx, ipv4.String(), line, tcpPorts, udpPorts, rawJobs)
 			}
+		}
+	}
+}
+
+// dispatchJobs pushes the generated structs into the routing channel with explicit protocol tags
+func dispatchJobs(ctx context.Context, ip string, targetName string, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) {
+	// 1. Dispatch TCP Vectors
+	for _, port := range tcpPorts {
+		select {
+		case <-ctx.Done():
+			return
+		case rawJobs <- models.ScanJob{TargetIP: ip, TargetName: targetName, Port: port, Protocol: "tcp"}:
+		}
+	}
+
+	// 2. Dispatch UDP Vectors
+	for _, port := range udpPorts {
+		select {
+		case <-ctx.Done():
+			return
+		case rawJobs <- models.ScanJob{TargetIP: ip, TargetName: targetName, Port: port, Protocol: "udp"}:
 		}
 	}
 }
@@ -107,7 +116,7 @@ func incIP(ip net.IP) {
 }
 
 // ParsePortRange parses comma-separated ports and ranges (Exported)
-func ParsePortRange(portStr string) ([]int, error) {
+func ParsePortRange(portStr string) ([]int, error) { 
 	var ports []int
 	parts := strings.Split(portStr, ",")
 
