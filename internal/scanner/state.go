@@ -32,8 +32,11 @@ func StateManager(db *bbolt.DB, results <-chan models.ScanResult, jsonMode bool)
 		var prevState string
 
 		// 2. Read-First Fast Path (Zero-Copy OS Page Cache)
-		db.View(func(tx *bbolt.Tx) error {
+		if err := db.View(func(tx *bbolt.Tx) error {
 			b := tx.Bucket([]byte("PortStates"))
+			if b == nil {
+				return fmt.Errorf("bucket PortStates not found.")
+			}
 			oldHash := b.Get(targetKey)
 
 			if oldHash == nil {
@@ -44,14 +47,22 @@ func StateManager(db *bbolt.DB, results <-chan models.ScanResult, jsonMode bool)
 				prevState = "MUTATED"
 			}
 			return nil
-		})
+		}); err != nil {
+			slog.Error ("Failed to execute read transaction", slog.String("error", err.Error()))
+		}
 
 		// 3. Slow Path (fsync) and SIEM Emission ONLY on Delta
 		if isDelta {
-			db.Update(func(tx *bbolt.Tx) error {
+			if err := db.Update(func(tx *bbolt.Tx) error {
 				b := tx.Bucket([]byte("PortStates"))
+				if b == nil {
+					return fmt.Errorf("bucket Porstates not found.")
+				}
 				return b.Put(targetKey, newHash)
-			})
+			}); err != nil {
+				slog.Error("Failed to execute write transaction", slog.String("error", err.Error()))
+				continue
+			}
 
 			if jsonMode {
 				slog.Info("delta_detected",
