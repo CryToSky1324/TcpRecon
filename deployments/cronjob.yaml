@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tcprecon-pvc
+  namespace: asm-secops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: tcprecon-engine
+  namespace: asm-secops
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            fsGroup: 10001
+          containers:
+          - name: tcprecon
+            image: internal-registry/tcprecon:latest
+            imagePullPolicy: IfNotPresent
+            env:
+            - name: TARGET_URL
+              value: "https://gist.githubusercontent.com/CryToSky1324/4280ac414df4c3f9398657b5344977f1/raw/43fe865067cb5fc70644d3af8b4df8edb587ac51/gistfile1.txt"
+            - name: DB_PATH
+              value: "/data/asm_state.db"
+            volumeMounts:
+            - name: bbolt-data
+              mountPath: /data
+            resources:
+              requests:
+                cpu: "500m"
+                memory: "256Mi"
+              limits:
+                cpu: "1000m"
+                memory: "512Mi" 
+          restartPolicy: Never
+          volumes:
+          - name: bbolt-data
+            persistentVolumeClaim:
+              claimName: tcprecon-pvc

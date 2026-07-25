@@ -4,15 +4,14 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
-	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
-	// IMPORTANT: Adjust these paths to match your actual go.mod module name
-	"github.com/CryToSky1324/TcpRecon/internal/models"
 	"github.com/CryToSky1324/TcpRecon/internal/scanner"
 	"github.com/CryToSky1324/TcpRecon/internal/utils"
 
@@ -20,88 +19,28 @@ import (
 )
 
 func main() {
-	// 1. CLI Configuration
 	workersPtr := flag.Int("w", 500, "Maximum number of concurrent Goroutine workers")
 	timeoutPtr := flag.Int("t", 1000, "Timeout per port in milliseconds")
-	portsPtr := flag.String("p", "1-1000", "Ports to scan (e.g., 80,443,1-1024)")
+	portsPtr := flag.String("p", "1-1000", "Ports to scan")
 	ratePtr := flag.Int("r", 100, "Global rate limit in packets per second (PPS)")
 	inputListPtr := flag.String("iL", "", "Input file containing list of targets/CIDRs")
-	debugPtr := flag.Bool("d", false, "Enable debug mode to log Layer 4 socket errors to stderr")
-	jsonPtr := flag.Bool("j", false, "Output results strictly in JSON format (mutes stdout text)")
+	debugPtr := flag.Bool("d", false, "Enable debug mode")
+	jsonPtr := flag.Bool("j", false, "Output results strictly in JSON format")
 
 	flag.Parse()
 
-	numWorkers := *workersPtr
-	timeout := time.Duration(*timeoutPtr) * time.Millisecond
-	debugMode := *debugPtr
-	jsonMode := *jsonPtr
-
-	// 12-Factor stream segregation: Lock structured logs to stdout
-	if jsonMode {
-		jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelInfo,
-		})
+	if *jsonPtr {
+		jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 		slog.SetDefault(slog.New(jsonHandler))
 	}
 
-	// 2. Stateless Parsing
 	portsToScan, err := utils.ParsePortRange(*portsPtr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] FATAL: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 3. Target Ingestion Pipeline
-	targetList := make(models.TargetMap)
-
-	if *inputListPtr != "" {
-		targetList = utils.IngestTargets(*inputListPtr)
-	} else {
-		rawTarget := flag.Arg(0)
-		if rawTarget == "" {
-			fmt.Fprintf(os.Stderr, "[!] FATAL: You must specify a target or an input file (-iL)\n")
-			os.Exit(1)
-		}
-
-		ips, err := net.LookupIP(rawTarget)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot resolve target %s: %v\n", rawTarget, err)
-			os.Exit(1)
-		}
-
-		var validIPs []string
-		for _, ip := range ips {
-			if ipv4 := ip.To4(); ipv4 != nil {
-				validIPs = append(validIPs, ipv4.String())
-			}
-		}
-
-		if len(validIPs) == 0 {
-			fmt.Fprintf(os.Stderr, "[!] FATAL: No IPv4 addresses found for %s\n", rawTarget)
-			os.Exit(1)
-		}
-		targetList[rawTarget] = validIPs
-	}
-
-	if len(targetList) == 0 {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: No valid targets loaded for scanning.\n")
-		os.Exit(1)
-	}
-
-	totalIPs := 0
-	for _, ips := range targetList {
-		totalIPs += len(ips)
-	}
-
-	if !jsonMode {
-		fmt.Fprintf(os.Stderr, "[*] Loaded targets resolving to %d unique IPv4 addresses\n", totalIPs)
-		fmt.Fprintf(os.Stderr, "[*] Initiating scan against %d ports with %d Goroutines...\n", len(portsToScan), numWorkers)
-		fmt.Fprintf(os.Stderr, "[*] Engine Throttled at %d PPS (Timeout: %s)\n", *ratePtr, timeout)
-	} else {
-		fmt.Fprintf(os.Stderr, "[*] Scanning %d IPs at %d PPS...\n", totalIPs, *ratePtr)
-	}
-
-	// 4. Context Management (SIGINT Trap)
+	// 1. Context Management (Moved up for HTTP Fetcher)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -109,15 +48,50 @@ func main() {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		fmt.Fprintln(os.Stderr, "\n[!] Aborting scan gracefully... Shutting down workers.")
+		fmt.Fprintln(os.Stderr, "\n[!] Aborting scan gracefully...")
 		cancel()
 	}()
 
-	// 4.5 Initialize State Store (Mapped to K8s PVC)
-	dbPath := "./asm_state.db" // Must be mounted via Docker/K8s, ./asm_state.db for local testing
-	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 1 * time.Second})
+	// 2. Dynamic Stream Routing (K8s Env vs Local CLI)
+	var targetStream io.ReadCloser
+	targetURL := os.Getenv("TARGET_URL")
+
+	if targetURL != "" {
+		targetStream, err = utils.FetchTargets(ctx, targetURL)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to stream targets from URL: %v\n", err)
+			os.Exit(1)
+		}
+	} else if *inputListPtr != "" {
+		targetStream, err = os.Open(*inputListPtr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open input file: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		rawTarget := flag.Arg(0)
+		if rawTarget == "" {
+			fmt.Fprintf(os.Stderr, "[!] FATAL: Specify a target, -iL, or TARGET_URL env var\n")
+			os.Exit(1)
+		}
+		targetStream = io.NopCloser(strings.NewReader(rawTarget))
+	}
+	defer targetStream.Close()
+
+	if !*jsonPtr {
+		fmt.Fprintf(os.Stderr, "[*] Initiating stream scan against %d ports with %d Goroutines...\n", len(portsToScan), *workersPtr)
+	}
+
+	// 3. State Store Initialization
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "./asm_state.db" // Fallback for local CLI testing
+	}
+
+	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
+
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to acquire DB lock. Is another instance running? %v\n", err)
+		fmt.Fprintf(os.Stderr, "[!] FATAL: DB lock failed (K8s Concurrency Violation): %v\n", err)
 		os.Exit(1)
 	}
 	defer db.Close()
@@ -127,18 +101,18 @@ func main() {
 		return err
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to initialize bucket: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[!] FATAL: Bucket init failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	// 5. Engine Invocation
-	resultsChan, startTime := scanner.Run(ctx, targetList, portsToScan, numWorkers, timeout, *ratePtr, debugMode, jsonMode)
+	// 4. Engine Invocation (Passing the io.Reader)
+	resultsChan, startTime := scanner.Run(ctx, targetStream, portsToScan, *workersPtr, time.Duration(*timeoutPtr)*time.Millisecond, *ratePtr, *debugPtr, *jsonPtr)
 
-	// 6. State Manager Execution
-	openPorts := scanner.StateManager(db, resultsChan, jsonMode)
+	// 5. State Manager Execution
+	openPorts := scanner.StateManager(db, resultsChan, *jsonPtr)
 	duration := time.Since(startTime)
 
-	if !jsonMode {
+	if !*jsonPtr {
 		fmt.Fprintf(os.Stderr, "[*] Scan completed in %.2f seconds. Discovered %d open ports.\n", duration.Seconds(), openPorts)
 	}
 }

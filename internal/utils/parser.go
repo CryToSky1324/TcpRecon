@@ -4,11 +4,79 @@ import (
 	"bufio"
 	"fmt"
 	"net"
-	"os"
 	"strings"
+	"io"
+	"net/http"
+	"context"
+	"time"
 
 	"github.com/CryToSky1324/TcpRecon/internal/models" // Replace 'github.com/CryToSky1324/TcpRecon' with your actual go.mod module name
 )
+
+// FetchTargets streams the target list from an external HTTP/S3 endpoint.
+func FetchTargets(ctx context.Context, targetURL string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to construct request: %w", err)
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("target fetch failed: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		return nil, fmt.Errorf("unexpected HTTP status: %d", resp.StatusCode)
+	}
+
+	return resp.Body, nil
+}
+
+// StreamTargets reads line-by-line, preventing heap exhaustion, and feeds the worker channel.
+func StreamTargets(ctx context.Context, r io.Reader, ports []int, jobs chan<- models.ScanJob) {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		if strings.Contains(line, "/") {
+			ips, err := expandCIDR(line)
+			if err != nil {
+				continue
+			}
+			for _, ip := range ips {
+				for _, port := range ports {
+					select {
+					case <-ctx.Done():
+						return
+					case jobs <- models.ScanJob{TargetIP: ip, TargetName: line, Port: port}:
+					}
+				}
+			}
+			continue
+		}
+
+		ips, err := net.LookupIP(line)
+		if err != nil {
+			continue
+		}
+		for _, ip := range ips {
+			if ipv4 := ip.To4(); ipv4 != nil {
+				for _, port := range ports {
+					select {
+					case <-ctx.Done():
+						return
+					case jobs <- models.ScanJob{TargetIP: ipv4.String(), TargetName: line, Port: port}:
+					}
+				}
+			}
+		}
+	}
+}
 
 // expandCIDR mathematically generates usable IPv4 addresses from a CIDR block (Unexported/Private to utils)
 func expandCIDR(cidr string) ([]string, error) {
@@ -36,54 +104,6 @@ func incIP(ip net.IP) {
 			break
 		}
 	}
-}
-
-// IngestTargets processes a target text file line-by-line (Exported)
-func IngestTargets(filePath string) models.TargetMap {
-	file, err := os.Open(filePath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL ERROR: Cannot open target file: %v\n", err)
-		os.Exit(1)
-	}
-	defer file.Close()
-
-	targets := make(models.TargetMap)
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		if strings.Contains(line, "/") {
-			ips, err := expandCIDR(line)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[!] Skipping invalid CIDR %s: %v\n", line, err)
-				continue
-			}
-			targets[line] = ips
-			continue
-		}
-
-		ips, err := net.LookupIP(line)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] Skipping unresolvable target %s: %v\n", line, err)
-			continue
-		}
-
-		var validIPs []string
-		for _, ip := range ips {
-			if ipv4 := ip.To4(); ipv4 != nil {
-				validIPs = append(validIPs, ipv4.String())
-			}
-		}
-		if len(validIPs) > 0 {
-			targets[line] = validIPs
-		}
-	}
-
-	return targets
 }
 
 // ParsePortRange parses comma-separated ports and ranges (Exported)
