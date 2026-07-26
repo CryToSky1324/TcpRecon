@@ -63,32 +63,66 @@ func main() {
 	}()
 
 	// 2. Dynamic Stream Routing (K8s Env vs Local CLI)
-	var targetStream io.Reader
+	// 1. Target & Input Resolution (Supporting positional args, -iL flag, stdin, and TARGET_URL env fallback)
+	var targetsReader io.Reader
+	targetArg := flag.Arg(0)
 
-	// 1. Check for POSIX stdin pipe (fd 0)
-	stat, _ := os.Stdin.Stat()
-	if (stat.Mode() & os.ModeCharDevice) == 0 {
-		targetStream = os.Stdin
+	if targetArg == "" {
+		targetArg = os.Getenv("TARGET_URL")
+	}
+
+	if targetArg != "" {
+		if strings.HasPrefix(targetArg, "http://") || strings.HasPrefix(targetArg, "https://") {
+			body, err := utils.FetchTargets(ctx, targetArg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to fetch remote target URL: %v\n", err)
+				os.Exit(1)
+			}
+			defer body.Close()
+			targetsReader = body
+		} else {
+			file, err := os.Open(targetArg)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open target file %s: %v\n", targetArg, err)
+				os.Exit(1)
+			}
+			defer file.Close()
+			targetsReader = file
+		}
 	} else if *inputListPtr != "" {
-		// 2. Check for input file list
 		file, err := os.Open(*inputListPtr)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open target file: %v\n", err)
+			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open input list file %s: %v\n", *inputListPtr, err)
 			os.Exit(1)
 		}
-		// Defer the close against the concrete *os.File struct, not the io.Reader interface
 		defer file.Close()
-		targetStream = file
-	} else if targetEnv := os.Getenv("TARGET_URL"); targetEnv != "" {
-		// 3. Check for Environment Variable
-		targetStream = strings.NewReader(targetEnv)
-	} else if len(flag.Args()) > 0 {
-		// 4. Check for positional CLI argument
-		targetStream = strings.NewReader(flag.Arg(0))
+		targetsReader = file
 	} else {
-		// 5. Fail fast if no valid stream source exists
+		stat, _ := os.Stdin.Stat()
+		if (stat.Mode() & os.ModeCharDevice) == 0 {
+			targetsReader = os.Stdin
+		}
+	}
+
+	if targetsReader == nil {
 		fmt.Fprintf(os.Stderr, "[!] FATAL: Specify a target, -iL, use stdin pipe, or TARGET_URL env var\n")
 		os.Exit(1)
+	}
+
+	// 2. Parse Port Vectors
+	tcpPortsToScan, err := utils.ParsePortString(*portsPtr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] FATAL: Invalid TCP port specification: %v\n", err)
+		os.Exit(1)
+	}
+
+	var udpPortsToScan []int
+	if *udpPortsPtr != "" {
+		udpPortsToScan, err = utils.ParsePortString(*udpPortsPtr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] FATAL: Invalid UDP port specification: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if !*jsonPtr {

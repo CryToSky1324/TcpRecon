@@ -31,10 +31,11 @@ spec:
           containers:
           - name: tcprecon
             image: ghcr.io/crytosky1324/tcprecon:latest
-            imagePullPolicy: Always
+            imagePullPolicy: IfNotPresent
             env:
             - name: TARGET_URL
-              value: "https://gist.githubusercontent.com/CryToSky1324/4280ac414df4c3f9398657b5344977f1/raw/43fe865067cb5fc70644d3af8b4df8edb587ac51/gistfile1.txt"
+              value: "https://gist.githubusercontent.com/CryToSky1324/4280ac414df4c3f9398657b5344977f1/raw/a89ce59170d8d2d51212f847c2a51c4dd685129f/gistfile1.txt"
+            - name: DB_PATH
             - name: DB_PATH
               value: "/data/asm_state.db"
             volumeMounts:
@@ -48,7 +49,7 @@ spec:
                 cpu: "1000m"
                 memory: "512Mi"
           imagePullSecrets:
-            - name: ghcr-secret
+          - name: ghcr-secret
           restartPolicy: OnFailure
           volumes:
           - name: bbolt-data
