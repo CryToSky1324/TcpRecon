@@ -35,22 +35,7 @@ func main() {
 		slog.SetDefault(slog.New(jsonHandler))
 	}
 
-	tcpPortsToScan, err := utils.ParsePortRange(*portsPtr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: %v\n", err)
-		os.Exit(1)
-	}
-
-	var udpPortsToScan []int
-    if *udpPortsPtr != "" {
-        udpPortsToScan, err = utils.ParsePortRange(*udpPortsPtr)
-        if err != nil {
-            fmt.Fprintf(os.Stderr, "[!] FATAL UDP Port syntax: %v\n", err)
-            os.Exit(1)
-        }
-    }
-
-	// 1. Context Management (Moved up for HTTP Fetcher)
+	// 1. Context Management & Signal Interception
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -62,8 +47,7 @@ func main() {
 		cancel()
 	}()
 
-	// 2. Dynamic Stream Routing (K8s Env vs Local CLI)
-	// 1. Target & Input Resolution (Supporting positional args, -iL flag, stdin, and TARGET_URL env fallback)
+	// 2. Dynamic Stream Routing (Supports Stdin, -iL flag, positional arg, and TARGET_URL env fallback)
 	var targetsReader io.Reader
 	targetArg := flag.Arg(0)
 
@@ -109,8 +93,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 3. Parse Port Vectors
 	// 2. Parse Port Vectors
-	tcpPortsToScan, err := utils.ParsePortString(*portsPtr)
+	tcpPortsToScan, err := utils.ParsePortRange(*portsPtr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] FATAL: Invalid TCP port specification: %v\n", err)
 		os.Exit(1)
@@ -118,7 +103,7 @@ func main() {
 
 	var udpPortsToScan []int
 	if *udpPortsPtr != "" {
-		udpPortsToScan, err = utils.ParsePortString(*udpPortsPtr)
+		udpPortsToScan, err = utils.ParsePortRange(*udpPortsPtr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[!] FATAL: Invalid UDP port specification: %v\n", err)
 			os.Exit(1)
@@ -128,16 +113,15 @@ func main() {
 	if !*jsonPtr {
 		totalPorts := len(tcpPortsToScan) + len(udpPortsToScan)
 		fmt.Fprintf(os.Stderr, "[*] Initiating stream scan against %d ports (%d TCP, %d UDP) with %d Goroutines...\n", totalPorts, len(tcpPortsToScan), len(udpPortsToScan), *workersPtr)
-    }
+	}
 
-	// 3. State Store Initialization
+	// 4. State Store Initialization (bbolt)
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
-		dbPath = "./asm_state.db" // Fallback for local CLI testing
+		dbPath = "./asm_state.db"
 	}
 
 	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
-
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] FATAL: DB lock failed (K8s Concurrency Violation): %v\n", err)
 		os.Exit(1)
@@ -153,10 +137,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 4. Engine Invocation (Passing the io.Reader)
-	resultsChan, startTime := scanner.Run(ctx, targetStream, tcpPortsToScan, udpPortsToScan, *workersPtr, time.Duration(*timeoutPtr)*time.Millisecond, *ratePtr, *debugPtr, *jsonPtr)
+	// 5. Engine Invocation (Passing targetsReader correctly)
+	resultsChan, startTime := scanner.Run(ctx, targetsReader, tcpPortsToScan, udpPortsToScan, *workersPtr, time.Duration(*timeoutPtr)*time.Millisecond, *ratePtr, *debugPtr, *jsonPtr)
 
-	// 5. State Manager Execution
+	// 6. State Manager Execution
 	openPorts := scanner.StateManager(db, resultsChan, *jsonPtr)
 	duration := time.Since(startTime)
 
