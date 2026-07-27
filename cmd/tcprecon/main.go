@@ -48,6 +48,7 @@ func main() {
 	}()
 
 	// 2. Dynamic Stream Routing (Supports Stdin, -iL flag, positional arg, and TARGET_URL env fallback)
+
 	var targetsReader io.Reader
 	targetArg := flag.Arg(0)
 
@@ -74,6 +75,7 @@ func main() {
 			targetsReader = file
 		}
 	} else if *inputListPtr != "" {
+		// Evaluates the -iL flag to satisfy the compiler and support local file ingestion
 		file, err := os.Open(*inputListPtr)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open input list file %s: %v\n", *inputListPtr, err)
@@ -93,7 +95,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 3. Parse Port Vectors
+
 	// 2. Parse Port Vectors
 	tcpPortsToScan, err := utils.ParsePortRange(*portsPtr)
 	if err != nil {
