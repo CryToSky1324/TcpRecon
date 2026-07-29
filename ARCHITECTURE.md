@@ -1,320 +1,352 @@
-# TcpRecon — System Architecture
+# TcpRecon System Architecture
 
-This document describes the architecture and evolution of the TcpRecon engine. It explains design goals, engineering problems, architectural solutions, tradeoffs, and implementation decisions across each major phase of development. Use this as a guide for contributors, reviewers, and maintainers.
+## 1. Purpose and scope
 
-Table of contents
-- [Overview](#overview)
-- [High-level architecture](#high-level-architecture)
-- [Phases of evolution](#phases-of-evolution)
-  - [Phase 1 — Python prototype & threading limitations](#phase-1---python-prototype--threading-limitations)
-  - [Phase 2 — Go migration & memory safety](#phase-2---go-migration--memory-safety)
-  - [Phase 3 — Application-layer banner grabbing & interface polymorphism](#phase-3---application-layer-banner-grabbing--interface-polymorphism)
-  - [Phase 4 — State exhaustion & traffic shaping](#phase-4---state-exhaustion--traffic-shaping)
-  - [Phase 5 — Cryptographic extraction & UNIX stream discipline](#phase-5---cryptographic-extraction--unix-stream-discipline)
-  - [Phase 6 — Wide-area scaling, ingestion backpressure & stateful edge filtering](#phase-6---wide-area-scaling-ingestion-backpressure--stateful-edge-filtering)
-  - [Phase 7 — Deployment, containerization & Kubernetes orchestration](#phase-7---deployment-containerization--kubernetes-orchestration)
-  - [SIEM ingestion & pipeline integration](#siem-ingestion--pipeline-integration)
-- [Observability, testing & benchmarks](#observability-testing--benchmarks)
-- [Configuration & operational guidance](#configuration--operational-guidance)
-- [Security, legal & ethics](#security-legal--ethics)
-- [Decision log & future work](#decision-log--future-work)
+TcpRecon is a network attack-surface monitoring platform built around a custom Go scanner. It continuously observes authorized network scopes, records service metadata, compares observations with a persistent baseline, and emits atomic security events for SIEM detection and analytics.
 
-## Overview
+The project is not intended to outperform or replace mature scanners. Its engineering objective is to demonstrate a complete and reproducible pipeline:
 
-TcpRecon is a TCP reconnaissance engine designed to perform precise TCP-level checks, extract application-layer banner and certificate metadata, scale across large target ranges, maintain stateful scan history, and deliver structured telemetry to SIEM infrastructure.
+```text
+network observation → normalized state → lifecycle event → detection → analysis → remediation evidence
+```
 
-The architecture evolved from a Python prototype into a Go-based concurrent engine, then into a stateful, containerized scanning pipeline capable of scheduled Kubernetes execution and Wazuh ingestion.
+## 2. Design principles
 
-The primary goals are:
-- Correct TCP port-state detection through full 3-way handshakes.
-- Efficient concurrent execution without uncontrolled resource exhaustion.
-- Application-layer banner and TLS certificate extraction.
-- Stateful delta tracking to suppress redundant SIEM events.
-- Low-memory streaming of large target ranges.
-- Clean JSONL/NDJSON output for Unix pipelines and SIEM ingestion.
-- Safe, repeatable deployment in immutable containers and Kubernetes.
+1. **Correctness before scale.** Input parsing, cancellation, state classification, and event semantics must be trustworthy before throughput is optimized.
+2. **Bounded concurrency.** Worker pools and bounded channels prevent unbounded goroutine and memory growth.
+3. **Controlled network impact.** A global rate limiter controls probe starts independently of concurrency.
+4. **Atomic telemetry.** Each NDJSON line contains one observation or lifecycle event.
+5. **Single ownership of persistent state.** A dedicated goroutine serializes bbolt writes.
+6. **No false remediation.** Partial or cancelled scans cannot replace a complete baseline.
+7. **Reproducible operations.** Wazuh rules, fixtures, mappings, dashboards, and deployment instructions belong in Git.
+8. **Honest claims.** Performance and reliability claims require tests and published evidence.
 
-Definitions
-- GIL: Global Interpreter Lock (Python)
-- C10k: Informal target of handling 10k concurrent connections
-- SNI: Server Name Indication (TLS)
-- SAN: Subject Alternative Name (TLS)
-- IPS: Intrusion Prevention System
-- JSONL / NDJSON: JSON Lines / Newline-Delimited JSON
-- PVC: PersistentVolumeClaim
-- SIEM: Security Information and Event Management
-
-## High-level architecture
-
-A concise view of the main components and data flow:
+## 3. System context
 
 ```mermaid
 flowchart LR
-  A[Input / Target Stream] --> B[Target Parser & CIDR Expansion]
-  B --> C[Backpressured Work Queue]
-  C --> D[Worker Pool / Goroutines]
-  D --> E[Context-Aware TCP Dial]
-  E --> F[Protocol Handlers: TCP, HTTP, TLS]
-  F --> G[Extraction & Normalization]
-  G --> H[Results Channel]
-  H --> I[Single State Manager]
-  I --> J[bbolt State Store]
-  I --> K[JSONL Delta Output]
-  K --> L[Wazuh / SIEM]
-  D --> M[Metrics & Debug Logs]
+  Scope[Authorized target scope] --> Input[Input source selection]
+  Input --> Parser[Streaming target and port parser]
+  Parser --> Queue[Bounded work queues]
+  Queue --> TCP[TCP worker pool]
+  Queue --> UDP[Selected UDP worker pool]
+  TCP --> Protocols[HTTP and TLS handlers]
+  UDP --> Protocols
+  Protocols --> Normalize[Observation normalization]
+  Normalize --> Results[Results channel]
+  Results --> State[Single state-manager goroutine]
+  State <--> Bolt[(bbolt state database)]
+  State --> Events[Versioned NDJSON events]
+  Events --> Wazuh[Wazuh manager]
+  Wazuh --> Indexer[Wazuh Indexer / OpenSearch]
+  Indexer --> Dashboard[Dashboards and remediation analytics]
+  TCP -. diagnostics .-> Stderr[stderr]
+  UDP -. diagnostics .-> Stderr
 ```
 
-Component responsibilities
-- Target Parser & CIDR Expansion: reads targets through an `io.Reader`, parses inputs line-by-line, and expands CIDRs on demand.
-- Backpressured Work Queue: bounds queued work to prevent target generation from overwhelming workers.
-- Worker Pool: executes concurrent probes using Goroutines and channels.
-- Context-Aware TCP Dial: performs cancellable connections with strict deadlines.
-- Protocol Handlers: performs TCP, HTTP, and TLS interactions through reusable `net.Conn` abstractions.
-- Extraction & Normalization: extracts banners, certificate metadata, SANs, and structured scan results.
-- State Manager: acts as the single writer to the bbolt state store.
-- State Store: stores hashes of previous observations for delta detection.
-- JSONL Delta Output: emits only new or changed observations.
-- SIEM Integration: forwards structured events into Wazuh and downstream OpenSearch pipelines.
-- Metrics & Debug Logs: keeps diagnostic output separate from machine-readable telemetry.
+## 4. Major components
 
-## Phases of evolution
+### 4.1 Input source selection
 
-Each phase uses the same structured format: Objective → Problem → Solution → Tradeoffs → Implementation notes.
+Target input may originate from a positional target, local file, standard input, or an authorized remote list. Input-source selection must be explicit and mutually unambiguous.
 
-### Phase 1 — Python prototype & threading limitations
+Required behavior:
 
-- **Objective:** Execute full, concurrent TCP 3-way handshakes to validate port states without relying on pre-packaged binaries such as Nmap.
-- **Problem:** The initial Python prototype used `concurrent.futures.ThreadPoolExecutor`. Python's Global Interpreter Lock restricted true parallel execution, while OS-level threads consumed significant memory. Scaling to thousands of concurrent threads caused severe memory usage and CPU context-switching overhead.
-- **Problem:** Blindly calling blocking `recv()` immediately after a successful handshake on client-first protocols such as HTTP caused workers to hang while servers waited for a client request. This consumed timeout capacity and stalled scanner throughput.
-- **Solution:** The Python implementation served as a proof of concept for validating TCP handshake logic and exposing concurrency and protocol-handling limitations.
-- **Tradeoffs:** Python provided fast iteration and simple experimentation but was unsuitable for the desired level of high-concurrency scanning.
-- **Implementation notes:** Preserve the prototype and its tests as reference artifacts for regression testing and debugging.
+- reject multiple conflicting sources;
+- reject excessive positional arguments;
+- validate URLs before network fetching;
+- resolve hostnames without terminating the whole process on one failure;
+- preserve target identity alongside resolved addresses;
+- stream large sources instead of loading them completely into memory.
 
-### Phase 2 — Go migration & memory safety
+### 4.2 Streaming parser
 
-- **Objective:** Achieve high concurrency and horizontal scalability without exhausting memory, file descriptors, or operating-system resources.
-- **Problem:** Unbounded concurrency can create race conditions, deadlocks, resource exhaustion, and uncontrolled network pressure.
-- **Solution:** Re-implemented the engine in Go using lightweight Goroutines multiplexed over a smaller pool of OS threads. Adopted a strict Worker Pool Pattern using Go channels for task distribution and result collection.
-- **Solution:** Used typed channel directions such as `<-chan` and `chan<-` to make data flow explicit and reduce accidental sharing. A dedicated monitor Goroutine managed `sync.WaitGroup` synchronization so the main execution path could consume results without deadlocking.
-- **Tradeoffs:** Go provides strong compile-time safety and low per-Goroutine overhead, but channel ownership, cancellation, and lifecycle management require discipline.
-- **Implementation notes:**
-  - Use `context.Context` for cancellation and deadlines.
-  - Avoid unbounded Goroutine creation.
-  - Keep shared mutable state minimal.
-  - Use channels to define ownership and data flow clearly.
-  - Preserve the worker-pool architecture as the primary concurrency boundary.
+The parser reads through `io.Reader` and produces normalized scan jobs. CIDR expansion should occur incrementally so producer memory remains bounded.
 
-### Phase 3 — Application-layer banner grabbing & interface polymorphism
+The parser is subject to backpressure. When work queues fill, parsing pauses until workers consume jobs. This prevents a fast producer from manufacturing millions of queued objects that contribute nothing except an eventual meeting with the OOM killer.
 
-- **Objective:** Extract useful application-layer banner data without allowing slow or silent servers to consume workers indefinitely.
-- **Problem:** Standard L4 TCP connections cannot extract application data from client-first servers unless the scanner proactively sends a request.
-- **Problem:** Go socket operations can block indefinitely by default when deadlines are not configured.
-- **Problem:** Passing unvalidated hostnames directly into lower-level socket operations can cause fatal DNS resolution failures and abruptly terminate the process.
-- **Solution:** Used Go's `net.Conn` interface as a common abstraction for standard TCP connections and TLS-wrapped connections. This allows protocol handlers to reuse the same read/write logic.
-- **Solution:** Injected an HTTP request such as `GET / HTTP/1.1\r\n\r\n` immediately after the TCP handshake to trigger responses from client-first web servers.
-- **Solution:** Applied strict `SetDeadline()`, `SetWriteDeadline()`, and `SetReadDeadline()` controls to prevent slow targets from permanently occupying workers.
-- **Solution:** Added pre-flight hostname resolution and validation before opening network sockets.
-- **Tradeoffs:** Protocol probing becomes more complex than a pure TCP scanner, but the resulting architecture provides significantly more useful reconnaissance data.
-- **Implementation notes:**
-  - Keep protocol handlers modular.
-  - Wrap TLS connections behind the same `net.Conn` abstraction.
-  - Ensure all network operations inherit cancellation and deadline behavior.
+### 4.3 Dispatcher and worker pools
 
-### Phase 4 — State exhaustion & traffic shaping
+The dispatcher routes jobs to protocol-specific worker pools.
 
-- **Objective:** Prevent self-inflicted denial of service, reduce unnecessary network pressure, and guarantee clean process termination.
-- **Problem:** Unthrottled concurrency can exhaust local ephemeral ports, saturate NAT state tables, and cause outbound connections to fail with errors such as `ENETUNREACH`.
-- **Problem:** Abrupt termination through SIGINT can abandon active connections and leave resources to be cleaned up by the operating system.
-- **Problem:** Concurrent workers writing directly to terminal output can interleave messages and corrupt human-readable diagnostics.
-- **Solution:** Decoupled concurrency from network throughput using token-bucket rate limiting through `golang.org/x/time/rate`.
-- **Solution:** Used `DialContext` and signal handling through `os/signal` and `context.Context` to propagate cancellation through pending network operations.
-- **Solution:** Routed debug output through Go's thread-safe `log` package and separated diagnostics from structured stdout output.
-- **Tradeoffs:** Rate limiting increases total scan duration, but it improves reliability, reduces resource exhaustion, and makes network behavior controllable.
-- **Implementation notes:**
-  - Use a conservative global rate limit.
-  - Configure burst capacity deliberately.
-  - Support graceful cancellation.
-  - Keep machine-readable output separate from human-readable diagnostics.
+- TCP workers use full-connect scanning through cancellable dials.
+- UDP workers send selected protocol-aware payloads and classify replies conservatively.
+- Channel direction types document ownership and prevent accidental misuse.
+- `sync.WaitGroup` and channel-closure ownership are centralized.
+- Worker counts are validated and bounded.
 
-### Phase 5 — Cryptographic extraction & UNIX stream discipline
+Concurrency controls the number of simultaneous operations. The rate limiter controls how quickly new probes begin. These are separate dimensions.
 
-- **Objective:** Extract hidden virtual-host infrastructure and deliver structured telemetry cleanly to automated pipelines.
-- **Problem:** Multi-tenant infrastructure behind edge load balancers can return generic certificates when accessed directly by IP, hiding the actual virtual host identity.
-- **Problem:** Human-readable terminal output is difficult to parse reliably in SIEM and Unix pipelines.
-- **Solution:** Injected the intended hostname into the TLS `ServerName` field to request the correct virtual-host certificate.
-- **Solution:** Parsed `PeerCertificates` and the TLS `ConnectionState` immediately after the handshake to extract certificate metadata and SANs without additional network requests.
-- **Solution:** Enforced strict stream separation. Human-readable diagnostics go to `stderr`, while structured JSONL/NDJSON telemetry is emitted exclusively to `stdout`.
-- **Tradeoffs:** SNI probing can reveal more infrastructure than a raw IP connection and must therefore be controlled under authorized scanning policies.
-- **Implementation notes:**
-  - Record the injected SNI alongside observed certificate data.
-  - Normalize certificate fields before output.
-  - Keep JSON output flat and stable for downstream parsers.
-  - Ensure stdout remains safe for direct piping into `jq`, Filebeat, or SIEM ingestion.
+### 4.4 Network operations
 
-### Phase 6 — Wide-area scaling, ingestion backpressure & stateful edge filtering
+All socket operations require deadlines and context cancellation.
 
-- **Objective:** Scale across large CIDR blocks while maintaining low memory usage, controlled queue growth, and minimal redundant SIEM telemetry.
-- **Problem:** Expanding massive CIDR ranges into in-memory maps or string slices creates heap pressure and can trigger Kubernetes OOMKills.
-- **Problem:** A target producer that runs faster than network workers can cause millions of pending jobs to accumulate in memory.
-- **Problem:** Writing scan state from thousands of Goroutines creates database mutex contention and disk synchronization bottlenecks.
-- **Problem:** Repeatedly reporting unchanged open ports creates SIEM noise and alert fatigue.
-- **Solution:** Refactored target ingestion to accept an `io.Reader` and stream targets line-by-line through `bufio.Scanner`.
-- **Solution:** Performed CIDR expansion on demand using bitwise operations rather than materializing entire target ranges in memory.
-- **Solution:** Applied channel backpressure by bounding the worker queue to approximately `numWorkers * 2`, forcing target generation to pause when workers are saturated.
-- **Solution:** Used bbolt as the state store and isolated database access behind a single dedicated State Manager Goroutine.
-- **Solution:** Stored `(IP:Port)` state keys and non-cryptographic xxHash values of observed payloads. Matching hashes are discarded immediately; changed observations take the slower write path and generate a JSON delta event.
-- **Tradeoffs:** Streaming and stateful processing reduce memory and SIEM noise but introduce checkpointing, persistence, and state-management complexity.
-- **Implementation notes:**
-  - Use deterministic target iteration.
-  - Add persistent cursors for resumable scans.
-  - Keep database writes serialized through the State Manager.
-  - Treat the hash fast path as an optimization, not a replacement for correct state semantics.
+TCP results distinguish stable states from operational errors:
 
-### Phase 7 — Deployment, containerization & Kubernetes orchestration
+- successful connection: `open`;
+- connection refused: generally `closed`;
+- timeout or no response: `unknown` or a carefully defined timeout state;
+- unreachable network, DNS failure, and cancellation: scanner or target-resolution errors.
 
-- **Objective:** Package the scanner into an immutable, minimal container and execute scans safely through Kubernetes scheduling.
-- **Problem:** A `scratch` image has no CA certificates, timezone data, or user database, causing HTTPS failures and forcing awkward runtime assumptions.
-- **Problem:** bbolt requires an exclusive file lock, so overlapping Pods can collide when accessing the same persistent database.
-- **Problem:** An unprivileged UID cannot write to a read-only container root filesystem.
-- **Solution:** Used a multi-stage build with a Go Alpine builder, `CGO_ENABLED=0`, pure-Go DNS resolution, and static linking. Copied only the binary and required runtime assets into the final `scratch` image.
-- **Solution:** Added an unprivileged user with UID 10001 and copied required `/etc/passwd`, CA certificate, and timezone data.
-- **Solution:** Used Kubernetes `concurrencyPolicy: Forbid` to prevent overlapping CronJob executions.
-- **Solution:** Used a `ReadWriteOnce` PVC for exclusive state storage.
-- **Solution:** Added dynamic database path configuration through `DB_PATH`, routing bbolt storage to the mounted `/data` volume.
-- **Tradeoffs:** Minimal containers reduce attack surface but require deliberate dependency management and explicit inclusion of runtime assets.
-- **Implementation notes:**
-  - Pin builder and application versions.
-  - Keep the final image free of unnecessary shells and package managers.
-  - Ensure persistent storage permissions match the runtime UID.
-  - Treat CronJob concurrency and database locking as a single operational concern.
+A timeout alone must not be presented as proof of firewall filtering.
 
-### SIEM ingestion & pipeline integration
+UDP classification is protocol-dependent and more uncertain. Positive application responses are stronger evidence than silence.
 
-- **Objective:** Securely ingest scanner telemetry, decode events, and generate actionable security alerts in Wazuh.
-- **Problem:** Nested JSON structures can be flattened or truncated by decoder behavior, making traditional scanner output difficult to process.
-- **Problem:** Wazuh is an active detection engine rather than a passive log forwarder, so malformed or undecoded events may be silently dropped.
-- **Problem:** Incorrect APT keyring permissions can prevent unprivileged package verification.
-- **Problem:** Filebeat template URLs that return HTML error pages instead of JSON cause template parsing failures.
-- **Solution:** Used `tee` to write structured scanner JSON to `/var/log/tcprecon.json` while preserving debug telemetry on `stderr`.
-- **Solution:** Created custom Wazuh decoders and rules targeting the `open_port_detected` signature and dynamically mapping fields such as `ip` and `port`.
-- **Solution:** Escalated exposed SSH/port 22 events to a Level 10 critical alert.
-- **Solution:** Re-imported and dearmored the Wazuh GPG key and explicitly corrected permissions for unprivileged APT verification.
-- **Solution:** Pinned the Filebeat template to the exact Wazuh v4.8.0 version and verified successful OpenSearch index mapping.
-- **Tradeoffs:** SIEM integration requires strict schema stability and careful decoder/rule design, but provides operational visibility and automated alerting.
-- **Implementation notes:**
-  - Keep scanner output schema versioned.
-  - Test decoder behavior with representative JSONL events.
-  - Separate ingestion failures from detection-rule failures.
-  - Pin external templates and dependencies where reproducibility matters.
+### 4.5 Protocol metadata
 
-## Observability, testing & benchmarks
+HTTP handlers may send a bounded request to client-first services. TLS handlers may use SNI when a hostname is available and collect:
 
-Metrics to expose:
-- Probes/sec.
-- Successful and failed probes.
-- Failure reasons.
-- Average latency per port.
-- Tokens consumed.
-- Error rates.
-- Goroutine count.
-- Open file descriptors.
-- Queue depth and backpressure events.
-- State-store reads, writes, and hash matches.
-- Number of emitted deltas versus suppressed duplicates.
+- certificate subject and issuer;
+- SANs;
+- negotiated TLS version;
+- cipher suite;
+- validity period;
+- verification result.
 
-Logging:
-- Structured logs with trace or probe identifiers.
-- Human-readable diagnostics on `stderr`.
-- Machine-readable scan results on `stdout`.
+Reads and banners must be size-limited. Raw server content is untrusted input and must not be allowed to produce unbounded events.
 
-Tests:
-- Unit tests for target parsing and CIDR expansion.
-- Unit tests for protocol handlers.
-- Tests for TLS certificate and SAN extraction.
-- Tests for hash-based state comparison.
-- Integration tests using local HTTP and TLS test servers.
-- Cancellation and deadline tests.
-- Wazuh decoder and rule validation tests.
+### 4.6 Observation normalization
 
-Benchmarks:
-- Targets/sec against rate-limit settings.
-- Memory usage during large CIDR scans.
-- Queue behavior under producer/consumer imbalance.
-- bbolt read/write performance.
-- State deduplication efficiency.
-- End-to-end scanner-to-SIEM ingestion latency.
+Internal worker structures are not serialized directly. A dedicated event model isolates the public telemetry contract from implementation details.
 
-CI:
-- Run deterministic unit tests on every change.
-- Keep heavy network integration tests optional or gated.
-- Include static analysis, race detection, and container image validation.
+Stable comparison inputs may include:
 
-## Configuration & operational guidance
+- protocol;
+- normalized IP address;
+- port;
+- service state;
+- normalized service name;
+- bounded normalized banner;
+- certificate fingerprint or stable certificate fields.
 
-Default configuration values:
-- Rate limit: conservative deployment-specific default.
-- Burst capacity: deliberately bounded to prevent traffic spikes.
-- Connection timeout: strict and configurable.
-- Read/write deadline: shorter than the overall connection timeout.
-- Worker count: sized according to available CPU, file descriptors, and network capacity.
-- Queue size: approximately `numWorkers * 2` unless workload testing justifies another value.
-- Database path: configurable through `DB_PATH`.
+Unstable fields must not influence state hashes:
 
-Runtime flags and environment:
-- `--targets`
-- `--ports`
-- `--rate`
-- `--output-format`
-- `--resume-checkpoint`
-- `DB_PATH`
+- scan timestamp;
+- latency;
+- event ID;
+- temporary OS error text;
+- worker or rate settings.
 
-Example execution:
+### 4.7 State manager and bbolt
+
+Workers never write directly to bbolt. They send normalized observations to a single state-manager goroutine.
+
+The database requires a versioned schema with metadata such as:
+
+```text
+metadata/schema_version
+metadata/created_at
+scope/<scope_id>/baseline/...
+scope/<scope_id>/scan/<scan_id>/...
+finding/<finding_id>/...
+```
+
+State keys include protocol, address, and port. TCP and UDP observations for the same numbered port are separate services.
+
+## 5. Lifecycle reconciliation
+
+Hash suppression alone detects first-seen or changed open observations, but cannot reliably detect service closure. Complete lifecycle tracking compares a finished scan with the previous committed baseline.
+
+```text
+current - previous                         = opened
+current ∩ previous with different hash    = changed
+previous - current                         = closed
+previously closed and observed again       = reopened
+```
+
+### 5.1 Commit rule
+
+A scan baseline may be committed only when:
+
+- all intended target and port jobs were produced;
+- worker processing completed;
+- the process was not cancelled;
+- no fatal parser or state error made the scan incomplete.
+
+Temporary observations are discarded after incomplete scans. This invariant prevents a network outage or Ctrl+C from being celebrated as successful remediation.
+
+### 5.2 Stable identifiers
+
+- `scan_id`: unique to one execution;
+- `scope_id`: stable hash of normalized targets, ports, and protocols;
+- `finding_id`: stable identity of a service finding within a scope;
+- `event.id`: unique lifecycle event identifier.
+
+Worker count, rate limit, timeout, timestamps, and duration do not belong in `scope_id`.
+
+## 6. Event pipeline
+
+TcpRecon emits one versioned NDJSON object per event.
+
+```text
+stdout → events only
+stderr → diagnostics only
+```
+
+The lifecycle vocabulary is:
+
+- `service.opened`
+- `service.changed`
+- `service.closed`
+- `service.reopened`
+- optional operational events such as `scan.failed`
+
+The canonical schema is defined in [`docs/EVENT_SCHEMA.md`](./docs/EVENT_SCHEMA.md).
+
+## 7. Wazuh integration
+
+Wazuh reads the event file using a JSON `<localfile>` configuration. Repository-owned integration assets should be arranged as:
+
+```text
+deployments/wazuh/
+├── README.md
+├── config/
+│   └── tcprecon-localfile.xml
+├── rules/
+│   └── tcprecon_rules.xml
+├── fixtures/
+│   ├── service-opened.ndjson
+│   ├── service-changed.ndjson
+│   ├── service-closed.ndjson
+│   └── deprecated-tls.ndjson
+└── scripts/
+    ├── install-rules.sh
+    └── uninstall-rules.sh
+```
+
+Rule design should separate:
+
+1. base event recognition;
+2. lifecycle classification;
+3. policy violations;
+4. asset context;
+5. risk escalation.
+
+An open SSH port is not automatically a critical incident. Severity depends on whether the service is approved, exposed, vulnerable, newly introduced, or located on a critical asset.
+
+Every fixture must be tested with `wazuh-logtest` before manager restart.
+
+## 8. OpenSearch analytics
+
+Dashboard-critical fields require explicit mappings:
+
+| Field type | Mapping |
+|---|---|
+| IP address | `ip` |
+| port, risk score | numeric |
+| timestamps | `date` |
+| event type, severity, reason code | `keyword` |
+| owner, environment, criticality | `keyword` |
+| explanations and long banners | `text` plus bounded keyword fields only where justified |
+
+Numeric fields already support disk-backed aggregations. They should not be forced into `.keyword` mappings. FieldData should not be enabled merely to make an analyzed text field aggregate.
+
+Planned dashboards include current exposure, service changes, unresolved risk, deprecated TLS, certificate expiry, and remediation duration.
+
+## 9. Deployment architecture
+
+### 9.1 Container
+
+The container uses a multi-stage build and a minimal runtime:
+
+- static Go binary;
+- no shell or package manager;
+- CA certificates and timezone data copied explicitly;
+- unprivileged UID;
+- read-only root filesystem where possible;
+- all Linux capabilities dropped.
+
+### 9.2 Kubernetes
+
+Scheduled execution uses a CronJob with:
+
+- `concurrencyPolicy: Forbid`;
+- a `ReadWriteOnce` persistent volume for bbolt;
+- `DB_PATH` directed into the writable mount;
+- resource requests sized for the lab;
+- bounded scan scope and frequency.
+
+bbolt's exclusive file lock makes overlapping writers invalid by design, not merely inconvenient.
+
+### 9.3 Wazuh lab baseline
+
+The current lab baseline is a dedicated Ubuntu Server 24.04 LTS host with constrained hardware. The deployment should remain small, use short retention, and avoid enabling expensive workloads until the core manager, indexer, dashboard, and Filebeat services are stable.
+
+Version-specific installation instructions belong in deployment documentation because supported versions change. Architecture should describe invariants, not fossilize one afternoon's package versions.
+
+## 10. CI/CD and GitOps
+
+Pull requests and pushes should run:
 
 ```bash
-tcprecon --targets targets.txt --ports 22,80,443 --rate 50 --output ndjson
+gofmt verification
+go vet ./...
+go test ./...
+go test -race ./...
+go build ./cmd/tcprecon
 ```
 
-Example pipeline:
+Release automation may build and publish immutable OCI images to GHCR. Production hosts pull versioned images and do not compile or edit source code directly.
 
-```bash
-tcprecon --targets targets.txt --ports 22,80,443 --output ndjson 2>debug.log   | tee /var/log/tcprecon.json
-```
+Generated binaries, credentials, local state databases, certificates, and password archives must not be committed.
 
-Recommended runtime considerations:
-- Configure file-descriptor limits according to expected concurrency.
-- Ensure the state database resides on persistent storage when running in Kubernetes.
-- Ensure the runtime UID has write access to the mounted state directory.
-- Avoid overlapping scans against the same bbolt database.
-- Monitor queue depth, open connections, and state-store latency.
+## 11. Security boundaries
 
-## Security, legal & ethics
+- The scanner operates only within explicit authorized scope.
+- Remote target lists are untrusted input and require HTTPS, size limits, timeouts, and validation.
+- Banners and certificate fields are untrusted and must be bounded before logging.
+- Secrets for GHCR, Wazuh, Slack, or other integrations remain outside Git.
+- Rate limiting protects local and target resources; it is not an evasion mechanism.
+- Telemetry integrity matters because malformed or mixed stdout can corrupt downstream detection.
 
-- Scanning networks and hosts without authorization may be illegal or violate provider policies.
-- Obtain permission before scanning infrastructure that you do not own or administer.
-- SNI injection and certificate querying can still be considered intrusive depending on the environment.
-- Rate limiting should be used to reduce unnecessary network impact, not as a mechanism for unauthorized activity.
-- SIEM integrations must protect credentials, logs, and persistent state.
-- Follow responsible disclosure procedures when authorized testing identifies security issues.
+## 12. Verification strategy
 
-## Decision log & future work
+### Unit tests
 
-Maintain a `CHANGELOG` or `DECISIONS.md` documenting:
-- Why the Python prototype was replaced.
-- Why Go and the Worker Pool Pattern were selected.
-- Why strict deadlines and context cancellation were introduced.
-- Why SNI injection was adopted.
-- Why streaming ingestion and channel backpressure were required.
-- Why bbolt and a single State Manager were selected.
-- Why delta hashing was introduced to reduce SIEM noise.
-- Why scratch-based deployment and Kubernetes `Forbid` scheduling were adopted.
-- Why Wazuh decoder/rule customization was required.
+- port and protocol parsing;
+- target and input-source parsing;
+- CIDR iteration;
+- state-key construction;
+- normalized hashing;
+- event serialization;
+- lifecycle-set reconciliation;
+- risk-score boundaries.
 
-Future work:
-- Resumable scans with persistent checkpoints.
-- Distributed scanning coordination with secure authentication.
-- Pluggable output connectors for Kafka, S3, and Elastic.
-- Advanced TLS protocol heuristics such as ALPN parsing.
-- HTTP/2 probing.
-- Improved state compaction and retention policies.
-- Distributed state management for multi-node scanning.
-- More advanced Wazuh enrichment and correlation rules.
+### Local integration tests
+
+- loopback TCP listener;
+- closed local port;
+- local HTTP test server;
+- local TLS test server;
+- selected UDP responders;
+- deadline and cancellation behavior;
+- stdout/stderr separation;
+- database restart and migration behavior.
+
+### End-to-end lab test
+
+1. Start an authorized lab service.
+2. Complete a scan and emit `service.opened`.
+3. Repeat the scan and emit no duplicate lifecycle event.
+4. Change the service and emit `service.changed`.
+5. Stop the service and emit `service.closed`.
+6. Restart it and emit `service.reopened`.
+7. Confirm Wazuh decoding and expected rule matches.
+8. Confirm OpenSearch fields and dashboard visibility.
+
+## 13. Deliberate non-goals
+
+Until the vertical slice is complete, the project will not prioritize:
+
+- distributed scanner coordination;
+- Kafka or large streaming platforms;
+- broad vulnerability detection;
+- Internet-wide scanning;
+- complex multi-tenant dashboards;
+- claims of C10k, million-socket, or fixed per-worker memory performance without reproducible benchmarks.
+
+## 14. Historical evolution
+
+The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based state suppression, and expanded into container, Kubernetes, Wazuh, and OpenSearch workflows.
+
+Those milestones explain the design, but historical implementation anecdotes do not override the current contracts documented here.

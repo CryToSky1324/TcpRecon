@@ -1,155 +1,176 @@
 # TcpRecon
 
-This is a custom-engineered, highly concurrent TCP port scanner and network reconnaissance engine written in Go.
+TcpRecon is a Go-based network attack-surface monitoring project for authorized environments. It combines controlled TCP and selected UDP probing, application and TLS metadata collection, persistent state comparison, NDJSON telemetry, and planned Wazuh/OpenSearch integration.
 
-## Table of Contents
+The project is intentionally scoped as a reproducible security-engineering platform, not a replacement for mature scanners such as Nmap or enterprise vulnerability-management products. Its value is the complete pipeline from observation to state change, detection, analysis, and remediation evidence.
 
-- [Core Capabilities](#core-capabilities)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Usage & Command Line Flags](#usage--command-line-flags)
-- [Operational Execution Examples](#operational-execution-examples)
-- [Understanding Results](#understanding-results)
-- [Performance Tuning](#performance-tuning)
-- [Limitations & Caveats](#limitations--caveats)
-- [Architecture](#architecture)
+> **Project status:** active development. Core scanning, structured output, state storage, containerization, and orchestration foundations exist. CLI correctness, lifecycle reconciliation, reproducible Wazuh deployment, and risk analytics are being hardened before a stable release.
 
-## Core Capabilities
+## Why this project exists
 
-- **C10k-Capable Concurrency**: Utilizes a strict Goroutine Worker Pool pattern to multiplex millions of socket operations with a minimal memory footprint (starting at ~2KB per worker).
+TcpRecon demonstrates how raw network observations can become useful security telemetry:
 
-- **Token-Bucket Rate Limiting**: Completely decouples concurrency from throughput. A global token bucket enforces a strict Packets-Per-Second (PPS) ceiling to prevent self-imposed DoS and hardware lock-up.
+```text
+authorized target scope
+        ↓
+streamed target parsing
+        ↓
+bounded TCP and UDP worker pools
+        ↓
+HTTP, TLS, and protocol metadata
+        ↓
+single-writer state comparison
+        ↓
+atomic NDJSON events
+        ↓
+Wazuh detection and OpenSearch analytics
+```
 
-- **Context-Aware Teardown**: Traps OS signals (e.g., SIGINT via Ctrl+C) to instantly propagate cancellation across all active workers, safely tearing down TCP connections without leaking file descriptors.
+## Current capabilities
 
-- **Application-Layer Injection**: Automatically injects HTTP GET payloads and wraps ports 443/8443 in TLS to force "client-first" protocols to reveal their banners instantly, bypassing standard socket-level silence.
+| Area | Status | Notes |
+|---|---|---|
+| TCP full-connect scanning | Implemented | Uses bounded Go worker pools and cancellable network operations. |
+| Selected UDP probes | Implemented | Protocol-aware payloads for a limited set of services. |
+| Rate limiting | Implemented | Controls probe starts independently from worker concurrency. |
+| HTTP and TLS metadata | Implemented | Includes banner and certificate metadata where available. |
+| Target streaming | Partially implemented | File, standard input, and remote-source support exist; large-range behavior is being hardened. |
+| NDJSON output | Implemented | Machine-readable events on `stdout`; diagnostics belong on `stderr`. |
+| Persistent state | Implemented, incomplete lifecycle | bbolt and xxHash suppress unchanged observations; complete opened/closed/reopened reconciliation is in progress. |
+| Container image | Implemented | Multi-stage static build with a minimal unprivileged runtime. |
+| Kubernetes CronJob | Implemented | Uses persistent storage and non-overlapping execution. |
+| Wazuh integration | Rebuild in progress | Configuration is being converted from host-local changes into version-controlled deployment assets. |
+| Explainable risk and remediation analytics | Planned | Depends on complete lifecycle tracking and asset context. |
 
-- **Cryptographic X.509 Extraction**: Injects Server Name Indication (SNI) to force edge load balancers to serve actual domain certificates. Extracts Subject Alternative Names (SANs) directly from the TLS handshake.
+## Repository layout
 
-- **Mass-Scale Target Ingestion**: Ingests targets via an -iL list, mathematically expanding CIDR blocks using bitwise operations and dynamically mapping hostnames to IPs before scanning.
+The exact tree may evolve, but the project is organized around these responsibilities:
 
-- **Strict UNIX Stream Discipline**: Isolates human-readable diagnostic logs to stderr and outputs structured, machine-readable JSON exclusively to stdout for flawless CI/CD, jq, and SIEM integration.
+```text
+cmd/tcprecon/              CLI entry point
+internal/                  scanner, protocol, state, and event packages
+deployments/               container, Kubernetes, and Wazuh assets
+docs/                      architecture, schema, roadmap, and operations
+.github/workflows/         CI and release automation
+```
 
-## Installation
+## Build from source
 
-You must have Go 1.16+ installed to enforce strict dependency management. A C compiler (gcc/clang) may be required on some platforms for CGO support.
+### Requirements
+
+- The Go version declared in [`go.mod`](./go.mod)
+- Git
+- Linux, macOS, or Windows through WSL for the best-tested environment
 
 ```bash
-# Initialize the module
-go mod init custom-scanner
+git clone https://github.com/CryToSky1324/TcpRecon.git
+cd TcpRecon
 
-# Fetch the rate-limiting dependency
-go get golang.org/x/time/rate
-
-# Sync dependencies and compile the statically linked binary
-go mod tidy
-go build -o scanner scanner.go
+go mod download
+go build -o tcprecon ./cmd/tcprecon
+./tcprecon -h
 ```
 
-## Quick Start
+Use the binary's `-h` output as the source of truth for currently implemented flags. The CLI is being normalized, so documentation should not pretend flags are stable before the code agrees. Revolutionary concept, apparently.
+
+## Safe local example
+
+Run TcpRecon only against systems you own or are explicitly authorized to assess.
 
 ```bash
-./scanner google.com                           # Scan top 1000 ports (default)
-./scanner -p 80,443 -w 100 192.168.1.0/24     # Scan specific ports on a subnet
-./scanner -p 443 -r 50 -d example.com         # Slow, stealth scan with debug logging
+./tcprecon -p 22,80,443 -w 50 -r 50 127.0.0.1
 ```
 
-## Usage & Command Line Flags
-
-The engine enforces strict IPv4 resolution and drops invalid targets before a single socket is opened. You must specify either a single target as a positional argument or a target list via the -iL flag.
-
-```plaintext
-Usage: ./scanner [flags] <target>
-
-Flags:
-  -w int    Maximum number of concurrent Goroutine workers (default: 500)
-  -t int    Timeout per port in milliseconds (default: 1000)
-  -p string Ports to scan (e.g., 80,443,1-1024) (default: "1-1000")
-  -r int    Global rate limit in packets per second (PPS) (default: 100)
-  -iL file  Input file containing list of targets/CIDRs
-  -d        Enable debug mode to log Layer 4 socket errors to stderr
-  -j        Output results strictly in JSON format (mutes stdout text)
-```
-
-## Operational Execution Examples
-
-### 1. The Stealth Probe (Targeted)
-
-Scan the top 10,000 ports of a single host, aggressively throttled to 50 packets per second to evade IPS, while dumping Layer 4 drop-rules to stderr.
+For a list of lab targets:
 
 ```bash
-./scanner -w 500 -t 2000 -r 50 -p 1-10000 -d scanme.nmap.org
+./tcprecon -p 22,80,443 -iL targets.txt
 ```
 
-### 2. Wide-Area Mass Scanning
-
-Ingest a mixed text file containing single IPs, hostnames, and full CIDR blocks (e.g., 10.0.0.0/8). The engine will expand the CIDRs mathematically and scan port 443 across all endpoints.
+Separate events from diagnostics:
 
 ```bash
-./scanner -w 1000 -t 1500 -r 250 -p 443 -iL targets.txt
+./tcprecon -j -p 22,80,443 127.0.0.1 \
+  > events.ndjson \
+  2> diagnostics.log
 ```
 
-### 3. CI/CD & SIEM Ingestion (JSON Mode)
-
-Execute a fast scan against Google's edge infrastructure. Diagnostic updates bypass the pipe via stderr, while the pristine JSON payload flows directly into jq for parsing.
+Validate the event stream:
 
 ```bash
-./scanner -w 500 -t 1000 -r 100 -p 443 -j google.com | jq .
+jq -c . < events.ndjson
 ```
 
-## Example Output
+## Output contract
 
-```json
-{
-  "target": "google.com",
-  "target_ip": "172.217.27.14",
-  "duration_seconds": 0.118,
-  "total_open": 1,
-  "ports": [
-    {
-      "port": 443,
-      "state": "OPEN",
-      "banner": "HTTP/1.1 301 Moved Permanently Location: http://www.google.com/...",
-      "tls_subject": "*.google.com",
-      "tls_issuer": "WR2",
-      "tls_sans": [
-        "*.google.com",
-        "*.cloud.google.com",
-        "*.gemini.cloud.google.com",
-        "youtube.com"
-      ]
-    }
-  ]
-}
-```
+TcpRecon follows a strict stream contract:
 
-## Understanding Results
+- `stdout`: NDJSON security events only
+- `stderr`: diagnostics, progress, warnings, and internal errors
 
-- **state**: OPEN, CLOSED, or FILTERED based on TCP handshake response.
-- **banner**: HTTP/TLS application-layer response (often reveals service version or redirect target).
-- **tls_subject**: Primary subject CN from the X.509 certificate.
-- **tls_issuer**: Certificate issuer (CA name).
-- **tls_sans**: Subject Alternative Names — additional domains/IPs covered by the certificate.
+Each line on `stdout` represents one observation or lifecycle event. Aggregate documents containing arrays of ports are deliberately avoided because atomic events are easier to validate, ingest, correlate, and replay.
 
-## Performance Tuning
+A simplified event shape is documented in [`docs/EVENT_SCHEMA.md`](./docs/EVENT_SCHEMA.md).
 
-- **-w (workers)**: More workers = higher concurrency. 500–2000 typical. Monitor OS file handle limits with `ulimit -n` to avoid exhaustion.
-- **-r (rate)**: Global rate limit in PPS. Balanced between DoS avoidance and detection evasion. Lower = stealthier, slower.
-- **-t (timeout)**: Connection timeout per port in milliseconds. Reduce for speed on local networks, increase for high-latency targets.
+## Stateful monitoring
 
-**Example tuning for a /16 subnet scan:**
+TcpRecon uses bbolt as an embedded state store and xxHash for fast comparison of normalized service observations. A dedicated state-manager goroutine owns database writes, preventing network workers from fighting over disk locks like humans around the final charging socket.
+
+The target lifecycle model is:
+
+- `service.opened`
+- `service.changed`
+- `service.closed`
+- `service.reopened`
+
+Only a successfully completed scan may replace a committed baseline. Cancelled or partial scans must never create false closure events.
+
+## Deployment
+
+The project supports a minimal static container and scheduled Kubernetes execution. Persistent bbolt storage requires:
+
+- a writable mounted data directory;
+- a single active writer;
+- non-overlapping CronJob runs;
+- a stable database path such as `DB_PATH=/data/tcprecon.db`.
+
+Wazuh deployment assets will live under `deployments/wazuh/` so the integration can be rebuilt from Git rather than from somebody's fading memory of commands typed at 2 a.m.
+
+## Development checks
+
+Run these before opening a pull request:
+
 ```bash
-./scanner -w 1000 -t 1500 -r 500 -p 443 10.0.0.0/16
+gofmt -w .
+git diff --exit-code
+go vet ./...
+go test ./...
+go test -race ./...
+go build ./cmd/tcprecon
 ```
 
-## Limitations & Caveats
+Tests should use loopback listeners, temporary files, and Go test servers. Automated tests must not scan public hosts.
 
-- **Network Access**: Requires Internet/network access to target addresses. Firewall rules and IPS systems may block or throttle scans.
-- **CIDR Limits**: CIDR blocks are practically limited to /0-/30 for sanity. Larger expansions can exhaust memory/time.
-- **Platform**: Linux/Unix optimized. Windows is supported via WSL or MinGw.
-- **Legal**: Only scan targets you own or have explicit written permission to scan. Unauthorized scanning is illegal in most jurisdictions.
-- **Resolution**: IPv6 is not currently supported; only IPv4 targets are processed.
+## Documentation
 
-## Architecture
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md): system boundaries, data flow, state model, deployment, and design decisions
+- [`docs/EVENT_SCHEMA.md`](./docs/EVENT_SCHEMA.md): versioned NDJSON contract and lifecycle semantics
+- [`docs/ROADMAP.md`](./docs/ROADMAP.md): current delivery phases and completion gates
+- [`SECURITY.md`](./SECURITY.md): authorized-use policy and vulnerability reporting
 
-For a deep dive into the engineering decisions, state table exhaustion physics, and the evolution of this project from Python threads to Go multiplexing, read [ARCHITECTURE.md](./ARCHITECTURE.md).
+## Limitations
+
+- The scanner is not a vulnerability scanner and does not prove exploitability.
+- A timeout does not always prove that a port is filtered.
+- UDP state classification is inherently less certain than TCP full-connect results.
+- IPv6 and very large CIDR behavior must be verified against the current implementation.
+- Stateful closure detection is not trustworthy until full-scan reconciliation is complete.
+- Performance claims require published, reproducible benchmarks. None are implied merely because Go contains goroutines.
+
+## Legal and ethical use
+
+Use TcpRecon only on infrastructure you own or have explicit permission to test. Rate limiting is for reliability, resource protection, and controlled assessment. It is not marketed as an evasion or stealth feature.
+
+## License
+
+See the repository license file for applicable terms.
