@@ -34,7 +34,7 @@ spec:
           - name: tcprecon
             image: ghcr.io/crytosky1324/tcprecon:latest
             imagePullPolicy: IfNotPresent
-            args: ["https://gist.githubusercontent.com/CryToSky1324/4280ac414df4c3f9398657b5344977f1/raw/a89ce59170d8d2d51212f847c2a51c4dd685129f/gistfile1.txt"]
+            args: ["-j", "https://gist.githubusercontent.com/CryToSky1324/4280ac414df4c3f9398657b5344977f1/raw/a89ce59170d8d2d51212f847c2a51c4dd685129f/gistfile1.txt"]
             env:
             - name: DB_PATH
               value: "/data/asm_state.db"
