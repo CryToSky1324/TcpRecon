@@ -2,12 +2,13 @@ package utils
 
 import (
 	"bufio"
-	"fmt"
-	"net"
-	"strings"
-	"io"
-	"net/http"
 	"context"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/CryToSky1324/TcpRecon/internal/models" // Replace 'github.com/CryToSky1324/TcpRecon' with your actual go.mod module name
@@ -59,9 +60,7 @@ func StreamTargets(ctx context.Context, r io.Reader, tcpPorts []int, udpPorts []
 			continue
 		}
 		for _, ip := range ips {
-			if ipv4 := ip.To4(); ipv4 != nil {
-				dispatchJobs(ctx, ipv4.String(), line, tcpPorts, udpPorts, rawJobs)
-			}
+			dispatchJobs(ctx, ip.String(), line, tcpPorts, udpPorts, rawJobs)
 		}
 	}
 }
@@ -116,16 +115,23 @@ func incIP(ip net.IP) {
 }
 
 // ParsePortRange parses comma-separated ports and ranges (Exported)
-func ParsePortRange(portStr string) ([]int, error) { 
+func ParsePortRange(portStr string) ([]int, error) {
 	var ports []int
 	parts := strings.Split(portStr, ",")
 
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if strings.Contains(part, "-") {
-			var start, end int
-			_, err := fmt.Sscanf(part, "%d-%d", &start, &end)
+			bounds := strings.Split(part, "-")
+			if len(bounds) != 2 {
+				return nil, fmt.Errorf("invalid port range syntax: %s", part)
+			}
+			start, err := strconv.Atoi(strings.TrimSpace(bounds[0]))
 			if err != nil {
+				return nil, fmt.Errorf("invalid port range syntax: %s", part)
+			}
+			end, err := strconv.Atoi(strings.TrimSpace(bounds[1]))
+			if err != nil || start > end {
 				return nil, fmt.Errorf("invalid port range syntax: %s", part)
 			}
 			for p := start; p <= end; p++ {
@@ -135,8 +141,7 @@ func ParsePortRange(portStr string) ([]int, error) {
 				ports = append(ports, p)
 			}
 		} else {
-			var p int
-			_, err := fmt.Sscanf(part, "%d", &p)
+			p, err := strconv.Atoi(part)
 			if err != nil {
 				return nil, fmt.Errorf("invalid port syntax: %s", part)
 			}

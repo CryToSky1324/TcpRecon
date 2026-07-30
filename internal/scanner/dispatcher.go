@@ -2,9 +2,9 @@ package scanner
 
 import (
 	"context"
+	"io"
 	"sync"
 	"time"
-	"io"
 
 	"golang.org/x/time/rate"
 
@@ -13,14 +13,14 @@ import (
 )
 
 // Run orchestrates the Thread Pool, Channel Pipelines, and WaitGroups
-func Run(ctx context.Context, targetStream io.Reader, tcpPorts []int , udpPorts []int , numWorkers int, timeout time.Duration, rateLimit int, debugMode bool, jsonMode bool) (<-chan models.ScanResult, time.Time) {
+func Run(ctx context.Context, targetStream io.Reader, tcpPorts []int, udpPorts []int, numWorkers int, timeout time.Duration, rateLimit int, debugMode bool, jsonMode bool) (<-chan models.ScanResult, time.Time) {
 	// Token Bucket Rate Limiter
 	globalLimiter := rate.NewLimiter(rate.Limit(rateLimit), rateLimit)
 
 	// Replace the single 'jobs' channel in Run() with:
 	tcpJobs := make(chan models.ScanJob, numWorkers*2)
-  udpJobs := make(chan models.ScanJob, numWorkers*2)
-  rawJobs := make(chan models.ScanJob, numWorkers*2)
+	udpJobs := make(chan models.ScanJob, numWorkers*2)
+	rawJobs := make(chan models.ScanJob, numWorkers*2)
 	results := make(chan models.ScanResult)
 	var wg sync.WaitGroup
 
@@ -37,29 +37,28 @@ func Run(ctx context.Context, targetStream io.Reader, tcpPorts []int , udpPorts 
 	// 2. Spawn UDP Worker Pool (Allocate 25% of workers to UDP dials)
 	udpWorkers := numWorkers / 4
 	if udpWorkers < 1 {
-    udpWorkers = 1
+		udpWorkers = 1
 	}
 
 	for i := 0; i < udpWorkers; i++ {
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
-        UDPWorker(ctx, udpJobs, results, timeout, debugMode, globalLimiter)
-    }()
-}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			UDPWorker(ctx, udpJobs, results, timeout, debugMode, globalLimiter)
+		}()
+	}
 
-	
 	// 3. The Router Goroutine
 	go func() {
-    defer close(tcpJobs)
-    defer close(udpJobs)
-    for job := range rawJobs {
-        if job.Protocol == "udp" {
-            udpJobs <- job
-        } else {
-            tcpJobs <- job
-        }
-    }
+		defer close(tcpJobs)
+		defer close(udpJobs)
+		for job := range rawJobs {
+			if job.Protocol == "udp" {
+				udpJobs <- job
+			} else {
+				tcpJobs <- job
+			}
+		}
 	}()
 
 	// 4. Stream Producer

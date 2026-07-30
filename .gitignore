@@ -1,5 +1,6 @@
 # 1. Compiled Go Binaries
-./tcprecon
+/tcprecon
+bin/
 *.exe
 *.out
 *.test

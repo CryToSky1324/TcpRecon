@@ -4,10 +4,10 @@ package scanner
 import (
 	"context"
 	"fmt"
+	"github.com/CryToSky1324/TcpRecon/internal/models"
+	"golang.org/x/time/rate"
 	"net"
 	"time"
-	"golang.org/x/time/rate"
-	"github.com/CryToSky1324/TcpRecon/internal/models"
 )
 
 func UDPWorker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- models.ScanResult, timeout time.Duration, debug bool, limiter *rate.Limiter) {
@@ -34,7 +34,7 @@ func UDPWorker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- m
 			continue
 		}
 
-		address := fmt.Sprintf("%s:%d", job.TargetIP, job.Port)
+		address := joinHostPort(job.TargetIP, job.Port)
 		conn, err := net.Dial("udp", address)
 		if err != nil {
 			continue
@@ -45,7 +45,7 @@ func UDPWorker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- m
 			conn.Close()
 			continue
 		}
-		
+
 		if _, err := conn.Write(payload); err != nil {
 			conn.Close()
 			continue
@@ -59,7 +59,7 @@ func UDPWorker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- m
 		// Allocate memory and pull the payload from the socket buffer
 		buf := make([]byte, 1024)
 		n, err := conn.Read(buf)
-		
+
 		state := "FILTERED"
 		banner := ""
 
@@ -67,7 +67,7 @@ func UDPWorker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- m
 		if err == nil && n > 0 {
 			state = "OPEN"
 			// Sanitize raw bytes to hex to prevent JSON marshaller panics
-			banner = fmt.Sprintf("%x", buf[:n]) 
+			banner = fmt.Sprintf("%x", buf[:n])
 		}
 
 		conn.Close()

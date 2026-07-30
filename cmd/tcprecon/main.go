@@ -30,9 +30,16 @@ func main() {
 
 	flag.Parse()
 
+	handlerOptions := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if *jsonPtr {
-		jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
-		slog.SetDefault(slog.New(jsonHandler))
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, handlerOptions)))
+	} else {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, handlerOptions)))
+	}
+
+	if err := validateCLI(*workersPtr, *timeoutPtr, *ratePtr, flag.Args(), *inputListPtr); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] FATAL: %v\n", err)
+		os.Exit(1)
 	}
 
 	// 1. Context Management & Signal Interception
@@ -49,52 +56,14 @@ func main() {
 
 	// 2. Dynamic Stream Routing (Supports Stdin, -iL flag, positional arg, and TARGET_URL env fallback)
 
-	var targetsReader io.Reader
-	targetArg := flag.Arg(0)
-
-	if targetArg == "" {
-		targetArg = os.Getenv("TARGET_URL")
-	}
-
-	if targetArg != "" {
-		if strings.HasPrefix(targetArg, "http://") || strings.HasPrefix(targetArg, "https://") {
-			body, err := utils.FetchTargets(ctx, targetArg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to fetch remote target URL: %v\n", err)
-				os.Exit(1)
-			}
-			defer body.Close()
-			targetsReader = body
-		} else {
-			file, err := os.Open(targetArg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open target file %s: %v\n", targetArg, err)
-				os.Exit(1)
-			}
-			defer file.Close()
-			targetsReader = file
-		}
-	} else if *inputListPtr != "" {
-		// Evaluates the -iL flag to satisfy the compiler and support local file ingestion
-		file, err := os.Open(*inputListPtr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open input list file %s: %v\n", *inputListPtr, err)
-			os.Exit(1)
-		}
-		defer file.Close()
-		targetsReader = file
-	} else {
-		stat, _ := os.Stdin.Stat()
-		if (stat.Mode() & os.ModeCharDevice) == 0 {
-			targetsReader = os.Stdin
-		}
-	}
-
-	if targetsReader == nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: Specify a target, -iL, use stdin pipe, or TARGET_URL env var\n")
+	stat, statErr := os.Stdin.Stat()
+	stdinPiped := statErr == nil && (stat.Mode()&os.ModeCharDevice) == 0
+	targetsReader, err := selectTargetReader(ctx, flag.Args(), *inputListPtr, os.Getenv("TARGET_URL"), os.Stdin, stdinPiped)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[!] FATAL: %v\n", err)
 		os.Exit(1)
 	}
-
+	defer targetsReader.Close()
 
 	// 2. Parse Port Vectors
 	tcpPortsToScan, err := utils.ParsePortRange(*portsPtr)
@@ -149,4 +118,47 @@ func main() {
 	if !*jsonPtr {
 		fmt.Fprintf(os.Stderr, "[*] Scan completed in %.2f seconds. Discovered %d open ports.\n", duration.Seconds(), openPorts)
 	}
+}
+
+func validateCLI(workers, timeout, rateLimit int, args []string, inputList string) error {
+	if workers <= 0 {
+		return fmt.Errorf("workers must be greater than zero")
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("timeout must be greater than zero")
+	}
+	if rateLimit <= 0 {
+		return fmt.Errorf("rate must be greater than zero")
+	}
+	if len(args) > 1 {
+		return fmt.Errorf("expected at most one positional target")
+	}
+	if len(args) == 1 && inputList != "" {
+		return fmt.Errorf("positional target and -iL cannot be used together")
+	}
+	return nil
+}
+
+func selectTargetReader(ctx context.Context, args []string, inputList, targetURL string, stdin io.Reader, stdinPiped bool) (io.ReadCloser, error) {
+	if len(args) == 1 {
+		target := args[0]
+		if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+			return utils.FetchTargets(ctx, target)
+		}
+		return io.NopCloser(strings.NewReader(target + "\n")), nil
+	}
+	if inputList != "" {
+		file, err := os.Open(inputList)
+		if err != nil {
+			return nil, fmt.Errorf("cannot open input list file %s: %w", inputList, err)
+		}
+		return file, nil
+	}
+	if stdinPiped {
+		return io.NopCloser(stdin), nil
+	}
+	if targetURL != "" {
+		return utils.FetchTargets(ctx, targetURL)
+	}
+	return nil, fmt.Errorf("specify a target, -iL, use stdin pipe, or TARGET_URL env var")
 }
