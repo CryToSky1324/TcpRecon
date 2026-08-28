@@ -407,3 +407,217 @@ Explicit scan completion, versioned lifecycle persistence, temporary current-sca
 Stable service identity requires both deterministic hashing and a strict definition of which fields are allowed to influence identity. Mutable observation data such as banners, TLS metadata, state, timestamps, and scan settings must stay outside the key.
 
 Normalization belongs at the correct boundary. IP addresses have multiple equivalent textual representations, so canonicalization belongs in service identity.
+
+## 2026-08-24: B5 — Explicit Scan Completion
+
+### Goal
+
+Create a trustworthy scan-level completion boundary so TcpRecon can distinguish a genuinely complete scan from simple goroutine/channel termination before lifecycle reconciliation is allowed to interpret absence as service closure.
+
+The required invariant was:
+
+```text
+results channel closed != successful scan
+```
+
+B5 also had to make parser, resolution, cancellation, worker, and persistence failures visible to higher-level orchestration so B6 can forbid committed-baseline promotion after any incomplete scan.
+
+### Starting state
+
+Before B5, `scanner.Run` returned only a results channel and start time. The results channel closed after worker `WaitGroup` completion, but that only proved the workers had stopped.
+
+Several failure paths were still lossy:
+
+- `StreamTargets` did not return an error to scanner orchestration;
+- parse and target-resolution failures could skip intended work without producing a final failed-scan outcome;
+- router cancellation could occur but its returned error was discarded;
+- worker functions did not provide a reliable scan-level failure signal;
+- `StateManager` logged bbolt failures but returned only the open-port count;
+- `main` printed `Scan completed` without consulting a final scanner/persistence outcome.
+
+This meant a partial or failed execution could look indistinguishable from a completed run at the orchestration boundary.
+
+### Work completed
+
+I added `internal/scanner/scan_completion.go` with:
+
+- the `ScanStatus` type;
+- explicit status values for `completed`, `cancelled`, `resolution_failed`, `parse_failed`, `worker_failed`, and `state_failed`;
+- the `ScanCompletion` structure with `Status` and `Err`;
+- `Successful()`, which returns true only for `completed` with a nil error;
+- producer-error classification for cancellation, parse failure, and resolution failure.
+
+I changed target production so `StreamTargets` returns an error and preserves incomplete-scan diagnostics. Parse and resolution failures may allow remaining valid targets to continue, but the final producer result remains unsuccessful. Cancellation is propagated immediately.
+
+I added explicit asynchronous stage boundaries:
+
+- `produceTargets`;
+- `startTargetProducer`;
+- `routeJobs`;
+- `startJobRouter`;
+- `awaitScannerCompletion`;
+- `startScannerCompletion`.
+
+`scanner.Run` now returns:
+
+```text
+results channel
+completion channel
+start time
+```
+
+rather than treating result-channel closure as the success signal.
+
+I changed `StateManager` to return:
+
+```text
+(openPorts, stateErr)
+```
+
+instead of only the open-port count. The first persistence failure is retained, later state writes are skipped, and the function continues draining results until the scanner closes the channel.
+
+I added final CLI orchestration so `cmd/tcprecon/main.go` combines scanner completion and state-manager outcome before printing success.
+
+The final completion rules are:
+
+```text
+scanner success + state success
+-> completed
+
+scanner success + state failure
+-> state_failed
+
+scanner failure + state success
+-> preserve scanner failure
+
+scanner failure + state failure
+-> preserve scanner status and both diagnostic errors
+```
+
+I also made unsupported UDP work explicit. An intended UDP port without a supported payload is no longer silently skipped. `UDPWorker` records the first worker-level failure, continues draining queued jobs, and returns the retained error after normal job-channel exhaustion. `Run` propagates that outcome as `worker_failed`.
+
+### Problems encountered
+
+#### Cancellation race in `select`
+
+An early cancellation test initially passed in isolation but failed when repeated. The producer used a `select` containing both:
+
+```text
+ctx.Done()
+rawJobs <- job
+```
+
+When the context was already cancelled and the buffered channel also had space, both cases were ready. Go was allowed to choose the send, so a cancelled producer could occasionally finish with a nil error.
+
+I fixed this by checking `ctx.Err()` before the context-aware send and retaining the `select` for cancellation that occurs while a send is blocked. The previously flaky tests then passed 100 repeated runs.
+
+#### Goroutine errors disappeared at ownership boundaries
+
+`StreamTargets` and `routeJobs` could produce useful errors, but anonymous goroutines discarded them. I introduced one-result buffered error channels so the producer and router could publish their final outcomes without blocking result consumption.
+
+#### Persistence failure could become a deadlock
+
+The first idea was to return immediately from `StateManager` after a bbolt failure. That was unsafe because scanner workers could still be sending results. If the only consumer returned early, workers could block forever, preventing `wg.Wait()` and scanner completion.
+
+The corrected policy makes persistence failure sticky while continuing to drain the results channel.
+
+#### UDP worker failure could strand queued jobs
+
+Changing `UDPWorker` to return immediately on an unsupported payload exposed another pipeline risk: remaining UDP jobs could be left unconsumed, allowing the router to block.
+
+The worker was changed to retain the first error, continue draining queued jobs, and return the retained error only when its job channel closes.
+
+#### Completion helper missing from production code
+
+During CLI integration, `ScanCompletion.Successful()` was found to be missing from the production completion file. Scanner-focused work had not exposed the cross-package problem until `cmd/tcprecon` attempted to call it. The method was added to `internal/scanner/scan_completion.go`, restoring the intended scanner contract.
+
+### Decisions I made
+
+The success rule is intentionally strict:
+
+```text
+Status == completed
+AND
+Err == nil
+```
+
+Anything unknown, contradictory, cancelled, failed, or incomplete fails closed.
+
+Result-channel closure and scan completion remain separate concepts. The results channel is an observation-stream lifecycle signal; `ScanCompletion` is the authorization signal for later lifecycle-state promotion.
+
+Cancellation takes precedence over worker errors caused by the same cancelled context.
+
+Ordinary network-probe failures remain per-service conditions and do not become `worker_failed`. TCP connection failures, TLS/banner failures, UDP silence, and similar network behaviour are expected during scanning. `worker_failed` is reserved for failures that prevent intended work from being executed, such as unsupported requested UDP work.
+
+For multiple failures, the scanner status remains the primary classification while additional state failure diagnostics are preserved with joined errors rather than silently discarded.
+
+B5 does not implement the committed lifecycle baseline. It establishes the gate that B6 must enforce:
+
+```text
+ScanCompletion.Successful() == true
+```
+
+is required before baseline promotion is allowed.
+
+### Evidence
+
+Primary implementation and test files touched during B5 include:
+
+- `cmd/tcprecon/main.go`
+- `cmd/tcprecon/main_test.go`
+- `internal/scanner/dispatcher.go`
+- `internal/scanner/dispatcher_test.go`
+- `internal/scanner/scan_completion.go`
+- `internal/scanner/scan_completion_test.go`
+- `internal/scanner/state.go`
+- `internal/scanner/state_test.go`
+- `internal/scanner/udp_worker.go`
+- `internal/scanner/udp_worker_test.go`
+- `internal/utils/parser.go`
+- `internal/utils/parser_test.go`
+
+Final verification commands:
+
+```bash
+go test -count=100 ./internal/scanner \
+  -run 'TestRun|TestAwaitScannerCompletion|TestStartScannerCompletion|TestUDPWorker'
+
+go test -race -count=1 ./internal/scanner
+go test -race -count=1 ./cmd/tcprecon
+go vet ./...
+git diff --check
+go test -count=1 ./...
+```
+
+Observed result:
+
+- repeated completion and UDP-worker tests passed 100 runs;
+- scanner race-enabled tests passed;
+- CLI race-enabled tests passed;
+- `go vet ./...` produced no findings;
+- `git diff --check` produced no whitespace errors;
+- repository-wide tests passed.
+
+### Remaining limitations
+
+B5 does not yet create or reconcile a temporary current-scan observation set against a committed baseline. That is B6.
+
+`scope_id` and `service_key` remain verified identity helpers but are not yet the durable bbolt partition/key used by reconciliation.
+
+The exact persistent `service_key` v1 representation is still not frozen with a known-vector compatibility test. That should happen at the B6 persistence boundary.
+
+UDP socket reads remain deadline-bound rather than directly context-aware, so cancellation may be delayed until the current UDP read deadline expires even though the final scan is still classified as cancelled.
+
+Lifecycle event emission (`service.opened`, `service.changed`, `service.closed`, `service.reopened`) remains B7 work.
+
+### What I learned
+
+A concurrency pipeline needs explicit ownership not only for channels, but also for errors. A goroutine that can fail but has no outcome channel creates an information-loss boundary.
+
+Channel closure is a transport fact, not a correctness proof. A scan can finish producing results and still be incomplete.
+
+Fail-fast is not always safe in a producer/consumer pipeline. Sometimes the correct failure behaviour is to retain the error while continuing to drain work so other goroutines can terminate cleanly.
+
+Tests that pass once are not sufficient evidence for cancellation-sensitive code. Repeated focused tests exposed a real scheduling-dependent bug that ordinary single-run testing missed.
+
+B5 also reinforced the architectural separation between authorization and persistence: completion decides whether a baseline commit is allowed; B6 must implement the commit itself.

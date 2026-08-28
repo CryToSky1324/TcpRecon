@@ -1,14 +1,15 @@
 # 01_Current_Sprint: Phase B Service Lifecycle Foundation
 
-**Updated:** 6 August 2026  
-**Status:** ACTIVE  
+**Updated:** 24 August 2026
+**Status:** ACTIVE
 **Active branch:** `feat/service-lifecycle-reconciliation`
+**Current workstream:** B6 — Versioned state and reconciliation
 
 ## Sprint goal
 
-Replace TCPRecon's positive-observation hash suppression with a trustworthy lifecycle foundation. The scanner must eventually compare a completed current scan against a committed baseline and emit stable `service.opened`, `service.changed`, `service.closed`, and `service.reopened` events without treating cancelled or partial scans as remediation.
+Replace TCPRecon's positive-observation hash suppression with a trustworthy lifecycle foundation. The scanner must eventually compare a successfully completed current scan against a committed baseline and emit stable `service.opened`, `service.changed`, `service.closed`, and `service.reopened` events without treating cancelled or partial scans as remediation.
 
-This sprint is intentionally limited to identity, completion, state ownership, reconciliation, and evidence. Wazuh rules, dashboards, contextual risk scoring, and broad enrichment remain outside the active scope.
+This sprint remains limited to identity, completion, state ownership, reconciliation, and evidence. Wazuh rules, dashboards, contextual risk scoring, and broad enrichment remain outside the active scope.
 
 ---
 
@@ -19,8 +20,8 @@ This sprint is intentionally limited to identity, completion, state ownership, r
 **Status:** COMPLETE
 
 - Ubuntu Server 24.04 LTS is the supported lab baseline.
-- The Wazuh all-in-one environment has been rebuilt and verified.
-- TCPRecon-specific Wazuh rules and integrations have not yet been restored.
+- The Wazuh all-in-one environment was rebuilt and verified.
+- TCPRecon-specific Wazuh rules and integrations are not part of the active Phase B work.
 
 ### Phase A: Repository correctness and baseline tests
 
@@ -35,7 +36,7 @@ Verified work includes:
 - baseline unit tests, race-enabled tests, and `go vet` cleanup;
 - removal of the tracked binary and correction of repository documentation.
 
-Phase B is built on this baseline rather than reopening Phase A without new evidence.
+Phase B builds on this baseline rather than reopening Phase A without new evidence.
 
 ---
 
@@ -55,17 +56,19 @@ Phase B is built on this baseline rather than reopening Phase A without new evid
 
 **Status:** COMPLETE
 
-The current path was traced from CLI input through target parsing, dispatch, worker execution, the results channel, the state manager, bbolt, and event output.
+The runtime path was traced from CLI input through target parsing/resolution, dispatch, TCP/UDP worker execution, the results channel, the state manager, bbolt updates, and current output.
 
 Confirmed limitations:
 
 - workers mainly emit positive observations;
 - failed target resolution can be skipped without a scan-level failure result;
 - channel closure proves worker exit, not successful scan completion;
-- the state manager updates persistent state before a trustworthy completed-scan boundary exists;
+- persistent state is updated before a trustworthy completed-scan boundary exists;
 - absence cannot currently be interpreted as closure.
 
-### B2: Define lifecycle and identity contracts
+**Result:** B1 established the failure model that B2-B5 must respect.
+
+### B2: Define lifecycle and baseline contracts
 
 **Status:** COMPLETE ON PAPER
 
@@ -78,15 +81,22 @@ Defined contracts:
 - `scan_id`;
 - `scope_id`;
 - `service_key`;
-- `finding_id`;
 - stable observation fingerprints;
-- temporary current-scan observations versus committed baseline state.
+- temporary current-scan observations;
+- committed baseline state;
+- successful-scan-only baseline promotion.
 
-These contracts are design inputs. They are not yet runtime behaviour.
+The original B2 design also proposed `finding_id`. During B4 this was deliberately deferred because the current Phase B model has one lifecycle history per service and does not yet need a second permanent one-to-one identifier.
+
+Active identity model:
+
+```text
+scope_id -> service_key -> event_id
+```
 
 ### B3: Stable scan-scope identity
 
-**Status:** IMPLEMENTED AND VERIFIED LOCALLY; COMMIT PENDING
+**Status:** COMPLETE — IMPLEMENTED AND VERIFIED
 
 Implementation files:
 
@@ -95,27 +105,15 @@ Implementation files:
 
 Completed behaviour:
 
-- [x] Define a `ScanScope` from target definitions and separate TCP and UDP port sets.
-- [x] Trim and lowercase hostnames and remove a trailing dot.
-- [x] Canonicalise IP and IPv6 textual forms.
-- [x] Mask CIDRs to their network prefix.
+- [x] Define `ScanScope` from target definitions and separate TCP/UDP port sets.
+- [x] Normalize hostnames, IP addresses, IPv6 forms, and CIDRs.
 - [x] Remove duplicate targets and ports.
-- [x] Sort targets and port sets deterministically.
-- [x] Preserve TCP and UDP as separate parts of scope identity.
+- [x] Sort target and port sets deterministically.
+- [x] Preserve TCP and UDP as separate scope dimensions.
 - [x] Serialize a versioned canonical representation.
-- [x] Derive the scope ID with SHA-256.
-- [x] Exclude timestamps and execution-tuning settings from the identity model.
+- [x] Derive `scope_id` with SHA-256.
+- [x] Exclude timestamps and execution-tuning settings.
 - [x] Avoid mutating caller-owned input slices.
-
-Tests cover:
-
-- equivalent reordered and duplicated inputs;
-- changed target definitions;
-- changed TCP and UDP port sets;
-- TCP and UDP separation;
-- hostname, CIDR, IPv6, and whitespace normalization;
-- exclusion of execution settings;
-- input-slice immutability.
 
 Verification evidence:
 
@@ -128,52 +126,173 @@ go test -race -count=1 ./internal/scanner
 go vet ./internal/scanner
 ```
 
+Remaining limitation:
+
+`ScanScope.ID()` is still an isolated identity primitive. Runtime orchestration and bbolt baseline partitioning do not yet use it.
+
+### B4: Stable service identity
+
+**Status:** COMPLETE — IMPLEMENTED AND VERIFIED
+
+Implementation files:
+
+- `internal/scanner/service_identity.go`
+- `internal/scanner/service_identity_test.go`
+
+Identity contract:
+
+```text
+service_key = f(scope_id, canonical IP, port, protocol)
+```
+
+Completed behaviour:
+
+- [x] Identical services produce identical keys.
+- [x] Different ports produce different keys.
+- [x] TCP and UDP on the same IP/port produce different keys.
+- [x] Different IPs produce different keys.
+- [x] The same endpoint in different scopes produces different keys.
+- [x] Equivalent IPv6 textual forms produce identical keys.
+- [x] IPv4-mapped IPv6 and native IPv4 are canonicalized to the same identity through `Unmap()`.
+- [x] Invalid IP input returns an error.
+- [x] Protocol is strict and accepts only canonical lowercase `tcp` or `udp`.
+- [x] Ports outside `1..65535` are rejected.
+- [x] Port boundaries `1` and `65535` are accepted.
+- [x] Empty `scope_id` is rejected.
+- [x] Mutable observation fields are excluded structurally from `ServiceIdentity`.
+
+Verification evidence:
+
+```bash
+gofmt -w \
+  internal/scanner/service_identity.go \
+  internal/scanner/service_identity_test.go
+
+git diff --check
+go test -count=1 ./internal/scanner -run 'TestServiceIdentityKey'
+go test -count=1 ./internal/scanner
+go test -race -count=1 ./internal/scanner
+go vet ./internal/scanner
+```
+
 Observed result:
 
-- focused scope tests passed;
-- the full scanner package passed;
+- focused service-identity tests passed;
+- full scanner-package tests passed;
 - race-enabled scanner tests passed;
 - `go vet` produced no findings;
 - `git diff --check` produced no whitespace errors.
 
+Design decisions closed during B4:
+
+- `finding_id` is deferred until one service can own multiple independent security findings;
+- protocol normalization is not performed inside the identity layer; upstream code must provide canonical `tcp`/`udp` values and the identity layer validates them;
+- a fixed known-vector compatibility test is deferred until `service_key` becomes persistent bbolt state.
+
 Remaining limitation:
 
-`ScanScope.ID()` is still an isolated helper. The CLI does not yet construct it, `scanner.Run` does not receive it, scan results do not carry it, and bbolt does not partition state by it.
-
-### B4: Stable service and finding identity
-
-**Status:** NEXT
-
-Planned acceptance tests:
-
-- [ ] identical IPv4 service input produces the same service key;
-- [ ] equivalent IPv6 textual forms produce the same service key;
-- [ ] TCP and UDP on the same numbered port produce different service keys;
-- [ ] the same service within the same scope produces the same finding ID across process restarts;
-- [ ] the same service in a different scope produces a different finding ID;
-- [ ] transient observation fields do not affect identity;
-- [ ] identity generation does not mutate caller-owned values.
-
-Implementation begins only after the identity rules and failing tests are reviewed.
+`ServiceIdentity.Key()` is still isolated. It is not yet attached to runtime scan results, temporary current-scan observations, reconciliation, or bbolt keys.
 
 ### B5: Explicit scan completion
 
-**Status:** PENDING
+**Status:** COMPLETE — IMPLEMENTED AND VERIFIED
 
-- [ ] represent success, cancellation, target-resolution failure, parser failure, worker failure, and state failure;
-- [ ] distinguish worker completion from successful scan completion;
-- [ ] prevent incomplete scans from committing a baseline;
-- [ ] preserve evidence about why a scan was incomplete.
+Goal: create an explicit scan-level outcome so lifecycle logic can distinguish successful completion from worker/channel termination.
+
+Implemented completion contract:
+
+```text
+successful scan
+= producer success
++ router success
++ worker success
++ state persistence success
+```
+
+`ScanCompletion.Successful()` returns true only when:
+
+```text
+Status == completed
+AND
+Err == nil
+```
+
+Completed behaviour:
+
+- [x] define the `ScanCompletion` result type and ownership boundary;
+- [x] represent successful completion explicitly;
+- [x] represent cancellation explicitly;
+- [x] represent target-resolution failure that makes the intended scope incomplete;
+- [x] represent parser/job-production failure;
+- [x] represent worker failure that prevents intended work from completing;
+- [x] represent state-manager/persistence failure;
+- [x] distinguish result-channel closure from successful scan completion;
+- [x] expose scanner completion asynchronously from `scanner.Run`;
+- [x] preserve producer, router, worker, and persistence diagnostics;
+- [x] make persistence failure sticky while continuing to drain results;
+- [x] prevent unsupported UDP work from being silently skipped;
+- [x] keep worker failure sticky while draining queued UDP jobs;
+- [x] make CLI success reporting depend on finalized scanner + state completion;
+- [x] establish `Successful()` as the authorization gate that B6 must check before committed-baseline promotion;
+- [x] add focused, repeated, race-enabled, static-analysis, and repository-wide tests.
+
+Failure classification:
+
+```text
+cancellation          -> cancelled
+target parse failure  -> parse_failed
+resolution failure    -> resolution_failed
+worker failure        -> worker_failed
+state failure         -> state_failed
+unknown/inconsistent  -> unsuccessful (fail closed)
+```
+
+Safety invariant:
+
+```text
+results channel closed                  != successful scan
+absence + successful complete scan      = lifecycle evidence
+absence + incomplete/failed scan        = not closure evidence
+ScanCompletion.Successful() == false     = baseline promotion forbidden
+```
+
+Verification evidence:
+
+```bash
+go test -count=100 ./internal/scanner \
+  -run 'TestRun|TestAwaitScannerCompletion|TestStartScannerCompletion|TestUDPWorker'
+
+go test -race -count=1 ./internal/scanner
+go test -race -count=1 ./cmd/tcprecon
+go vet ./...
+git diff --check
+go test -count=1 ./...
+```
+
+Observed result:
+
+- repeated scanner completion/worker tests passed 100 runs;
+- race-enabled scanner tests passed;
+- race-enabled CLI tests passed;
+- `go vet ./...` produced no findings;
+- `git diff --check` produced no whitespace errors;
+- the full repository test suite passed.
+
+Boundary with B6:
+
+B5 determines whether a scan is eligible to advance durable lifecycle state. B6 owns the actual versioned baseline schema, temporary current-scan state, reconciliation, and atomic baseline promotion.
 
 ### B6: Versioned state and reconciliation
 
-**Status:** PENDING
+**Status:** NEXT / ACTIVE WORKSTREAM
 
 - [ ] add versioned bbolt metadata;
+- [ ] freeze the persistent `service_key` v1 representation with a known-vector compatibility test before using it as durable state;
 - [ ] isolate baselines by `scope_id`;
-- [ ] keep current observations separate from committed state;
+- [ ] key service records by `service_key`;
+- [ ] keep temporary current observations separate from committed state;
 - [ ] compute opened, changed, closed, and reopened transitions;
-- [ ] commit only after a complete successful scan;
+- [ ] commit only after B5 reports a complete successful scan;
 - [ ] preserve state across database restart;
 - [ ] define migration or explicit incompatibility behaviour.
 
@@ -182,6 +301,7 @@ Implementation begins only after the identity rules and failing tests are review
 **Status:** PENDING
 
 - [ ] emit one versioned NDJSON object per lifecycle event;
+- [ ] use the active identity chain `scope_id -> service_key -> event_id`;
 - [ ] include stable identifiers and timestamps;
 - [ ] suppress duplicate events for unchanged scans;
 - [ ] keep diagnostics on stderr;
@@ -208,22 +328,24 @@ Phase B is complete only when all of the following are demonstrated:
 
 ## Current documentation evidence
 
-This B3 shipment updates:
+B1-B5 are now documented as completed work with their limitations preserved. B6 is the next active workstream.
 
-- `ARCHITECTURE.md`, to separate current behaviour from target architecture and record the isolated scope-ID invariant;
-- `00_Architecture.md`, to record delivery status and Phase B progress;
-- `01_Current_Sprint.md`, to replace the stale Phase 0/Phase A plan with the active Phase B work;
-- `docs/development/DEVLOG.md`, to record implementation decisions, mistakes, verification, and limitations.
+Current documentation responsibilities:
 
-No README, changelog, event-schema, Wazuh, or dashboard update is required because B3 does not yet change user-visible runtime behaviour or emitted telemetry.
+- `ARCHITECTURE.md`: verified current architecture, invariants, explicit completion boundary, and planned reconciliation design;
+- `01_Current_Sprint.md`: active Phase B status and completion gates;
+- `docs/development/DEVLOG.md`: chronological engineering progression, mistakes, decisions, evidence, and limitations.
+
+README, changelog, event-schema, Wazuh, and dashboard documentation should not claim B6-B7 lifecycle behaviour until the corresponding runtime work exists and is verified.
 
 ---
 
 ## Immediate next actions
 
-1. Review the B3 code and documentation diff.
-2. Rewrite the personal reasoning portions of the devlog in the author's own words.
-3. Stage only the B3 implementation and documentation files.
-4. Re-run formatting, tests, race tests, `go vet`, and `git diff --check` against the staged change.
-5. Commit the bounded B3 shipment.
-6. Begin B4 with identity rules and failing tests before implementation.
+1. Begin B6 by defining versioned bbolt metadata and the scope-partitioned baseline layout.
+2. Freeze the persistent `service_key` v1 representation with a known-vector compatibility test before durable use.
+3. Introduce temporary current-scan observations separately from the committed baseline.
+4. Gate any baseline promotion on `ScanCompletion.Successful() == true`.
+5. Add reconciliation tests for opened, changed, closed, and reopened transitions before lifecycle-event emission.
+6. Preserve the B5 invariant that cancelled, failed, partial, or unresolved scans cannot replace the committed baseline.
+7. Re-run focused tests, full tests, race tests, `go vet`, and `git diff --check` before closing B6.
