@@ -2,12 +2,21 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/CryToSky1324/TcpRecon/internal/models"
 )
+
+type failingReader struct {
+	err error
+}
+
+func (r failingReader) Read(p []byte) (int, error) {
+	return 0, r.err
+}
 
 func TestParsePortRange(t *testing.T) {
 	tests := []struct {
@@ -75,5 +84,121 @@ func TestStreamTargetsIPv4AndIPv6(t *testing.T) {
 	want := []string{"127.0.0.1", "::1"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("target IPs = %v, want %v", got, want)
+	}
+}
+
+func TestStreamTargetsSuccessfulProduction(t *testing.T) {
+	jobs := make(chan models.ScanJob, 1)
+
+	err := StreamTargets(
+		context.Background(),
+		strings.NewReader("127.0.0.1\n"),
+		[]int{80},
+		nil,
+		jobs,
+	)
+	if err != nil {
+		t.Fatalf("StreamTargets() error = %v", err)
+	}
+}
+
+func TestStreamTargetsReportsParseFailure(t *testing.T) {
+	jobs := make(chan models.ScanJob, 2)
+
+	err := StreamTargets(
+		context.Background(),
+		strings.NewReader("127.0.0.1\n192.0.2.0/not-a-prefix\n::1\n"),
+		[]int{80},
+		nil,
+		jobs,
+	)
+
+	close(jobs)
+
+	var got []string
+	for job := range jobs {
+		got = append(got, job.TargetIP)
+	}
+
+	if err == nil {
+		t.Fatal("StreamTargets() unexpectedly returned nil error")
+	}
+	want := []string{"127.0.0.1", "::1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("target IPs = %v, want %v", got, want)
+	}
+	if !errors.Is(err, ErrTargetParse) {
+		t.Fatalf("StreamTargets() error = %v, want ErrTargetParse", err)
+	}
+}
+
+func TestStreamTargetsReportsResolutionFailure(t *testing.T) {
+	jobs := make(chan models.ScanJob, 2)
+
+	err := StreamTargets(
+		context.Background(),
+		strings.NewReader("127.0.0.1\ninvalid host name\n::1\n"),
+		[]int{80},
+		nil,
+		jobs,
+	)
+	close(jobs)
+
+	var got []string
+	for job := range jobs {
+		got = append(got, job.TargetIP)
+	}
+	if err == nil {
+		t.Fatal("StreamTargets() unexpectedly returned nil error")
+	}
+	want := []string{"127.0.0.1", "::1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("target IPs = %v, want %v", got, want)
+	}
+
+	if !errors.Is(err, ErrTargetResolution) {
+		t.Fatalf(
+			"StreamTargets() error = %v, want ErrTargetResolution",
+			err,
+		)
+	}
+}
+
+func TestStreamTargetsReportsReadFailure(t *testing.T) {
+	testErr := errors.New("read failed")
+	jobs := make(chan models.ScanJob, 1)
+
+	err := StreamTargets(
+		context.Background(),
+		failingReader{err: testErr},
+		[]int{80},
+		nil,
+		jobs,
+	)
+
+	if err == nil {
+		t.Fatal("StreamTargets() unexpectedly returned nil error")
+	}
+	if !errors.Is(err, ErrTargetParse) {
+		t.Fatalf("StreamTargets() error = %v, want ErrTargetParse", err)
+	}
+}
+
+func TestStreamTargetsReportsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	jobs := make(chan models.ScanJob, 1)
+
+	err := StreamTargets(
+		ctx,
+		strings.NewReader("127.0.0.1\n"),
+		[]int{80},
+		nil,
+		jobs,
+	)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StreamTargets() error = %v, want context.Canceled", err)
 	}
 }

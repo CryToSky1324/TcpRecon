@@ -10,27 +10,31 @@ import (
 	"time"
 )
 
-func UDPWorker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- models.ScanResult, timeout time.Duration, debug bool, limiter *rate.Limiter) {
+func UDPWorker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- models.ScanResult, timeout time.Duration, debug bool, limiter *rate.Limiter) error {
+	var workerErr error
+
 	for {
 		var job models.ScanJob
 		var ok bool
 
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case job, ok = <-jobs:
 			if !ok {
-				return
+				return workerErr
 			}
 		}
 
 		if err := limiter.Wait(ctx); err != nil {
-			return
+			return err
 		}
 
 		payload, exists := UDPPayloads[job.Port]
 		if !exists {
-			// Fail fast. If we can't inject a payload, we can't prove it's open.
+			if workerErr == nil {
+				workerErr = fmt.Errorf("unsupported UDP payload for port %d", job.Port)
+			}
 			continue
 		}
 

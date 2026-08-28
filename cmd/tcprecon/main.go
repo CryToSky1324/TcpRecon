@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -109,14 +110,46 @@ func main() {
 	}
 
 	// 5. Engine Invocation (Passing targetsReader correctly)
-	resultsChan, startTime := scanner.Run(ctx, targetsReader, tcpPortsToScan, udpPortsToScan, *workersPtr, time.Duration(*timeoutPtr)*time.Millisecond, *ratePtr, *debugPtr, *jsonPtr)
+	resultsChan, completionCh, startTime := scanner.Run(ctx, targetsReader, tcpPortsToScan, udpPortsToScan, *workersPtr, time.Duration(*timeoutPtr)*time.Millisecond, *ratePtr, *debugPtr, *jsonPtr)
 
 	// 6. State Manager Execution
-	openPorts := scanner.StateManager(db, resultsChan, *jsonPtr)
+	openPorts, stateErr := scanner.StateManager(db, resultsChan, *jsonPtr)
+	completion, ok := <-completionCh
+	if !ok {
+		completion = scanner.ScanCompletion{}
+	}
+
+	finalCompletion := finalizeScanCompletion(
+		completion,
+		stateErr,
+	)
+
 	duration := time.Since(startTime)
 
-	if !*jsonPtr {
-		fmt.Fprintf(os.Stderr, "[*] Scan completed in %.2f seconds. Discovered %d open ports.\n", duration.Seconds(), openPorts)
+	if finalCompletion.Successful() {
+		if !*jsonPtr {
+			fmt.Fprintf(
+				os.Stderr,
+				"[*] Scan completed in %.2f seconds. Discovered %d open ports.\n",
+				duration.Seconds(),
+				openPorts,
+			)
+		}
+	} else {
+		if finalCompletion.Err != nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"[!] Scan incomplete: status=%s error=%v\n",
+				finalCompletion.Status,
+				finalCompletion.Err,
+			)
+		} else {
+			fmt.Fprintf(
+				os.Stderr,
+				"[!] Scan incomplete: status=%s\n",
+				finalCompletion.Status,
+			)
+		}
 	}
 }
 
@@ -161,4 +194,28 @@ func selectTargetReader(ctx context.Context, args []string, inputList, targetURL
 		return utils.FetchTargets(ctx, targetURL)
 	}
 	return nil, fmt.Errorf("specify a target, -iL, use stdin pipe, or TARGET_URL env var")
+}
+
+func finalizeScanCompletion(
+	scannerCompletion scanner.ScanCompletion,
+	stateErr error,
+) scanner.ScanCompletion {
+	if stateErr == nil {
+		return scannerCompletion
+	}
+
+	if scannerCompletion.Successful() {
+		return scanner.ScanCompletion{
+			Status: scanner.ScanStatusStateFailed,
+			Err:    stateErr,
+		}
+	}
+
+	return scanner.ScanCompletion{
+		Status: scannerCompletion.Status,
+		Err: errors.Join(
+			scannerCompletion.Err,
+			stateErr,
+		),
+	}
 }

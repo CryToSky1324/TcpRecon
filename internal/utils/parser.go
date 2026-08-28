@@ -3,6 +3,7 @@ package utils
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +13,11 @@ import (
 	"time"
 
 	"github.com/CryToSky1324/TcpRecon/internal/models" // Replace 'github.com/CryToSky1324/TcpRecon' with your actual go.mod module name
+)
+
+var (
+	ErrTargetParse      = errors.New("target parse failed")
+	ErrTargetResolution = errors.New("target resolution failed")
 )
 
 // FetchTargets streams the target list from an external HTTP/S3 endpoint.
@@ -36,54 +42,85 @@ func FetchTargets(ctx context.Context, targetURL string) (io.ReadCloser, error) 
 }
 
 // StreamTargets reads line-by-line, preventing heap exhaustion, and feeds the worker channel.
-func StreamTargets(ctx context.Context, r io.Reader, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) {
+func StreamTargets(ctx context.Context, r io.Reader, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) error {
+	var streamErr error
 	scanner := bufio.NewScanner(r)
+
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-
+		// CIDR target
 		if strings.Contains(line, "/") {
 			ips, err := expandCIDR(line)
 			if err != nil {
+				if streamErr == nil {
+					streamErr = fmt.Errorf("%w: invalid CIDR %q: %v", ErrTargetParse, line, err)
+				}
 				continue
 			}
+
 			for _, ip := range ips {
-				dispatchJobs(ctx, ip, line, tcpPorts, udpPorts, rawJobs)
+				if err := dispatchJobs(ctx, ip, line, tcpPorts, udpPorts, rawJobs); err != nil {
+					return err
+				}
 			}
 			continue
 		}
 
+		// Hostname / IP target
 		ips, err := net.LookupIP(line)
 		if err != nil {
+			if streamErr == nil {
+				streamErr = fmt.Errorf("%w: target %q: %v", ErrTargetResolution, line, err)
+			}
 			continue
 		}
 		for _, ip := range ips {
-			dispatchJobs(ctx, ip.String(), line, tcpPorts, udpPorts, rawJobs)
+			if err := dispatchJobs(ctx, ip.String(), line, tcpPorts, udpPorts, rawJobs); err != nil {
+				return err
+			}
 		}
 	}
+
+	if err := scanner.Err(); err != nil {
+		if streamErr == nil {
+			streamErr = fmt.Errorf("%w: target stream read failed: %v", ErrTargetParse, err)
+		}
+	}
+	return streamErr
 }
 
 // dispatchJobs pushes the generated structs into the routing channel with explicit protocol tags
-func dispatchJobs(ctx context.Context, ip string, targetName string, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) {
+func dispatchJobs(ctx context.Context, ip string, targetName string, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) error {
 	// 1. Dispatch TCP Vectors
 	for _, port := range tcpPorts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case rawJobs <- models.ScanJob{TargetIP: ip, TargetName: targetName, Port: port, Protocol: "tcp"}:
 		}
 	}
 
 	// 2. Dispatch UDP Vectors
 	for _, port := range udpPorts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case rawJobs <- models.ScanJob{TargetIP: ip, TargetName: targetName, Port: port, Protocol: "udp"}:
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // expandCIDR mathematically generates usable IPv4 addresses from a CIDR block (Unexported/Private to utils)

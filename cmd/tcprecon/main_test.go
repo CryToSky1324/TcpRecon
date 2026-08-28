@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/CryToSky1324/TcpRecon/internal/scanner"
 )
 
 func TestValidateCLI(t *testing.T) {
@@ -89,5 +92,102 @@ func TestSelectTargetReader(t *testing.T) {
 				t.Fatalf("selected input = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFinalizeScanCompletionReportsStateFailure(t *testing.T) {
+	stateErr := errors.New("state write failed")
+
+	got := finalizeScanCompletion(
+		scanner.ScanCompletion{
+			Status: scanner.ScanStatusCompleted,
+		},
+		stateErr,
+	)
+
+	if got.Status != scanner.ScanStatusStateFailed {
+		t.Fatalf(
+			"finalizeScanCompletion() status = %q, want %q",
+			got.Status,
+			scanner.ScanStatusStateFailed,
+		)
+	}
+
+	if !errors.Is(got.Err, stateErr) {
+		t.Fatalf(
+			"finalizeScanCompletion() error = %v, want %v",
+			got.Err,
+			stateErr,
+		)
+	}
+
+	if got.Successful() {
+		t.Fatal("state-failed scan reported successful")
+	}
+}
+
+func TestFinalizeScanCompletionPreservesSuccess(t *testing.T) {
+	got := finalizeScanCompletion(
+		scanner.ScanCompletion{
+			Status: scanner.ScanStatusCompleted,
+		},
+		nil,
+	)
+
+	if got.Status != scanner.ScanStatusCompleted {
+		t.Fatalf(
+			"finalizeScanCompletion() status = %q, want %q",
+			got.Status,
+			scanner.ScanStatusCompleted,
+		)
+	}
+
+	if got.Err != nil {
+		t.Fatalf(
+			"finalizeScanCompletion() error = %v, want nil",
+			got.Err,
+		)
+	}
+
+	if !got.Successful() {
+		t.Fatal("successful scan reported unsuccessful")
+	}
+}
+
+func TestFinalizeScanCompletionPreservesScannerFailureAndStateError(t *testing.T) {
+	stateErr := errors.New("state write failed")
+
+	got := finalizeScanCompletion(
+		scanner.ScanCompletion{
+			Status: scanner.ScanStatusCancelled,
+			Err:    context.Canceled,
+		},
+		stateErr,
+	)
+
+	if got.Status != scanner.ScanStatusCancelled {
+		t.Fatalf(
+			"finalizeScanCompletion() status = %q, want %q",
+			got.Status,
+			scanner.ScanStatusCancelled,
+		)
+	}
+
+	if !errors.Is(got.Err, context.Canceled) {
+		t.Fatalf(
+			"finalizeScanCompletion() error = %v, want context.Canceled",
+			got.Err,
+		)
+	}
+
+	if !errors.Is(got.Err, stateErr) {
+		t.Fatalf(
+			"finalizeScanCompletion() error = %v, want state error",
+			got.Err,
+		)
+	}
+
+	if got.Successful() {
+		t.Fatal("failed scan reported successful")
 	}
 }
