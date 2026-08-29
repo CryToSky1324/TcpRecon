@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -14,7 +16,6 @@ import (
 
 	"github.com/CryToSky1324/TcpRecon/internal/scanner"
 	"github.com/CryToSky1324/TcpRecon/internal/utils"
-
 	"go.etcd.io/bbolt"
 )
 
@@ -30,9 +31,16 @@ func main() {
 
 	flag.Parse()
 
+	handlerOptions := &slog.HandlerOptions{Level: slog.LevelInfo}
 	if *jsonPtr {
-		jsonHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
-		slog.SetDefault(slog.New(jsonHandler))
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, handlerOptions)))
+	} else {
+		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, handlerOptions)))
+	}
+
+	if err := validateCLI(*workersPtr, *timeoutPtr, *ratePtr, flag.Args(), *inputListPtr); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] FATAL: %v\n", err)
+		os.Exit(1)
 	}
 
 	// 1. Context Management & Signal Interception
@@ -47,56 +55,7 @@ func main() {
 		cancel()
 	}()
 
-	// 2. Dynamic Stream Routing (Supports Stdin, -iL flag, positional arg, and TARGET_URL env fallback)
-
-	var targetsReader io.Reader
-	targetArg := flag.Arg(0)
-
-	if targetArg == "" {
-		targetArg = os.Getenv("TARGET_URL")
-	}
-
-	if targetArg != "" {
-		if strings.HasPrefix(targetArg, "http://") || strings.HasPrefix(targetArg, "https://") {
-			body, err := utils.FetchTargets(ctx, targetArg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to fetch remote target URL: %v\n", err)
-				os.Exit(1)
-			}
-			defer body.Close()
-			targetsReader = body
-		} else {
-			file, err := os.Open(targetArg)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open target file %s: %v\n", targetArg, err)
-				os.Exit(1)
-			}
-			defer file.Close()
-			targetsReader = file
-		}
-	} else if *inputListPtr != "" {
-		// Evaluates the -iL flag to satisfy the compiler and support local file ingestion
-		file, err := os.Open(*inputListPtr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[!] FATAL: Cannot open input list file %s: %v\n", *inputListPtr, err)
-			os.Exit(1)
-		}
-		defer file.Close()
-		targetsReader = file
-	} else {
-		stat, _ := os.Stdin.Stat()
-		if (stat.Mode() & os.ModeCharDevice) == 0 {
-			targetsReader = os.Stdin
-		}
-	}
-
-	if targetsReader == nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: Specify a target, -iL, use stdin pipe, or TARGET_URL env var\n")
-		os.Exit(1)
-	}
-
-
-	// 2. Parse Port Vectors
+	// 2. Parse Port Vectors before performing target-source I/O.
 	tcpPortsToScan, err := utils.ParsePortRange(*portsPtr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] FATAL: Invalid TCP port specification: %v\n", err)
@@ -112,41 +71,100 @@ func main() {
 		}
 	}
 
-	if !*jsonPtr {
-		totalPorts := len(tcpPortsToScan) + len(udpPortsToScan)
-		fmt.Fprintf(os.Stderr, "[*] Initiating stream scan against %d ports (%d TCP, %d UDP) with %d Goroutines...\n", totalPorts, len(tcpPortsToScan), len(udpPortsToScan), *workersPtr)
-	}
-
-	// 4. State Store Initialization (bbolt)
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
 		dbPath = "./asm_state.db"
 	}
 
-	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: DB lock failed (K8s Concurrency Violation): %v\n", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte("PortStates"))
-		return err
+	stat, statErr := os.Stdin.Stat()
+	stdinPiped := statErr == nil && (stat.Mode()&os.ModeCharDevice) == 0
+	outcome := runLifecycleRuntime(ctx, lifecycleRuntimeConfig{
+		DBPath: dbPath, TCPPorts: tcpPortsToScan, UDPPorts: udpPortsToScan,
+		Workers: *workersPtr, Timeout: time.Duration(*timeoutPtr) * time.Millisecond,
+		RateLimit: *ratePtr, DebugMode: *debugPtr, JSONMode: *jsonPtr,
+		Stdout: os.Stdout, Stderr: os.Stderr,
+	}, lifecycleRuntimeDependencies{
+		PrepareTargets: func(ctx context.Context) (*preparedTargetSource, error) {
+			source, err := selectTargetReader(ctx, flag.Args(), *inputListPtr, os.Getenv("TARGET_URL"), os.Stdin, stdinPiped)
+			if err != nil {
+				return nil, err
+			}
+			return prepareTargetSource(ctx, source)
+		},
+		OpenState: func(path string) (*bbolt.DB, error) {
+			return bbolt.Open(path, 0600, &bbolt.Options{Timeout: 5 * time.Second})
+		},
+		GenerateScanID: func() (string, error) { return generateRuntimeScanID(rand.Reader) },
+		StartScanner:   scanner.Run,
 	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: Bucket init failed: %v\n", err)
+	if outcome.Err != nil {
 		os.Exit(1)
 	}
+}
 
-	// 5. Engine Invocation (Passing targetsReader correctly)
-	resultsChan, startTime := scanner.Run(ctx, targetsReader, tcpPortsToScan, udpPortsToScan, *workersPtr, time.Duration(*timeoutPtr)*time.Millisecond, *ratePtr, *debugPtr, *jsonPtr)
+func validateCLI(workers, timeout, rateLimit int, args []string, inputList string) error {
+	if workers <= 0 {
+		return fmt.Errorf("workers must be greater than zero")
+	}
+	if timeout <= 0 {
+		return fmt.Errorf("timeout must be greater than zero")
+	}
+	if rateLimit <= 0 {
+		return fmt.Errorf("rate must be greater than zero")
+	}
+	if len(args) > 1 {
+		return fmt.Errorf("expected at most one positional target")
+	}
+	if len(args) == 1 && inputList != "" {
+		return fmt.Errorf("positional target and -iL cannot be used together")
+	}
+	return nil
+}
 
-	// 6. State Manager Execution
-	openPorts := scanner.StateManager(db, resultsChan, *jsonPtr)
-	duration := time.Since(startTime)
+func selectTargetReader(ctx context.Context, args []string, inputList, targetURL string, stdin io.Reader, stdinPiped bool) (io.ReadCloser, error) {
+	if len(args) == 1 {
+		target := args[0]
+		if strings.HasPrefix(target, "http://") || strings.HasPrefix(target, "https://") {
+			return utils.FetchTargets(ctx, target)
+		}
+		return io.NopCloser(strings.NewReader(target + "\n")), nil
+	}
+	if inputList != "" {
+		file, err := os.Open(inputList)
+		if err != nil {
+			return nil, fmt.Errorf("cannot open input list file %s: %w", inputList, err)
+		}
+		return file, nil
+	}
+	if stdinPiped {
+		return io.NopCloser(stdin), nil
+	}
+	if targetURL != "" {
+		return utils.FetchTargets(ctx, targetURL)
+	}
+	return nil, fmt.Errorf("specify a target, -iL, use stdin pipe, or TARGET_URL env var")
+}
 
-	if !*jsonPtr {
-		fmt.Fprintf(os.Stderr, "[*] Scan completed in %.2f seconds. Discovered %d open ports.\n", duration.Seconds(), openPorts)
+func finalizeScanCompletion(
+	scannerCompletion scanner.ScanCompletion,
+	stateErr error,
+) scanner.ScanCompletion {
+	if stateErr == nil {
+		return scannerCompletion
+	}
+
+	if scannerCompletion.Successful() {
+		return scanner.ScanCompletion{
+			Status: scanner.ScanStatusStateFailed,
+			Err:    stateErr,
+		}
+	}
+
+	return scanner.ScanCompletion{
+		Status: scannerCompletion.Status,
+		Err: errors.Join(
+			scannerCompletion.Err,
+			stateErr,
+		),
 	}
 }

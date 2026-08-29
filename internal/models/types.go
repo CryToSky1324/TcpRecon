@@ -21,4 +21,3 @@ type ScanJob struct {
 	Port       int
 	Protocol   string
 }
-

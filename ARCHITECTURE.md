@@ -1,8 +1,10 @@
 # TcpRecon System Architecture
 
+> **Document status:** This document separates verified current behaviour from target architecture. A component is described as **implemented** only when it exists on the active branch and has supporting verification. **Planned** sections describe the intended vertical slice and must not be read as current runtime behaviour.
+
 ## 1. Purpose and scope
 
-TcpRecon is a network attack-surface monitoring platform built around a custom Go scanner. It continuously observes authorized network scopes, records service metadata, compares observations with a persistent baseline, and emits atomic security events for SIEM detection and analytics.
+TcpRecon is a Go-based authorised network-observation engine. It performs TCP full-connect reconnaissance and selected UDP probes, collects service metadata, and reconciles successful scans into versioned bbolt lifecycle state. Lifecycle-event serialization remains under development.
 
 The project is not intended to outperform or replace mature scanners. Its engineering objective is to demonstrate a complete and reproducible pipeline:
 
@@ -10,47 +12,132 @@ The project is not intended to outperform or replace mature scanners. Its engine
 network observation → normalized state → lifecycle event → detection → analysis → remediation evidence
 ```
 
+The scanner, stable identity helpers, explicit scan-completion boundary, and versioned lifecycle-state subsystem are runtime-active. The CLI now reconciles successful scans into scope-partitioned committed baselines while preserving baselines for incomplete scans. Lifecycle-event serialization, Wazuh detection, and OpenSearch remediation analytics remain later parts of the vertical slice unless a section explicitly states otherwise.
+
 ## 2. Design principles
 
 1. **Correctness before scale.** Input parsing, cancellation, state classification, and event semantics must be trustworthy before throughput is optimized.
 2. **Bounded concurrency.** Worker pools and bounded channels prevent unbounded goroutine and memory growth.
 3. **Controlled network impact.** A global rate limiter controls probe starts independently of concurrency.
-4. **Atomic telemetry.** Each NDJSON line contains one observation or lifecycle event.
-5. **Single ownership of persistent state.** A dedicated goroutine serializes bbolt writes.
+4. **Atomic telemetry.** Once B7 activates output, each NDJSON line will contain one lifecycle event.
+5. **Single ownership of persistent state.** Runtime coordination serializes observation persistence and finalization after scanner writers are quiescent.
 6. **No false remediation.** Partial or cancelled scans cannot replace a complete baseline.
 7. **Reproducible operations.** Wazuh rules, fixtures, mappings, dashboards, and deployment instructions belong in Git.
 8. **Honest claims.** Performance and reliability claims require tests and published evidence.
 
 ## 3. System context
 
+### 3.1 Current scanner pipeline
+
+**Status: implemented with lifecycle reconciliation active; B7 event emission pending.**
+
 ```mermaid
 flowchart LR
-  Scope[Authorized target scope] --> Input[Input source selection]
-  Input --> Parser[Streaming target and port parser]
-  Parser --> Queue[Bounded work queues]
-  Queue --> TCP[TCP worker pool]
-  Queue --> UDP[Selected UDP worker pool]
-  TCP --> Protocols[HTTP and TLS handlers]
-  UDP --> Protocols
-  Protocols --> Normalize[Observation normalization]
-  Normalize --> Results[Results channel]
-  Results --> State[Single state-manager goroutine]
-  State <--> Bolt[(bbolt state database)]
-  State --> Events[Versioned NDJSON events]
-  Events --> Wazuh[Wazuh manager]
-  Wazuh --> Indexer[Wazuh Indexer / OpenSearch]
-  Indexer --> Dashboard[Dashboards and remediation analytics]
+  Scope[Authorised target input] --> Input[Input source selection]
+  Input --> Parser[Streaming target parser / resolver]
+  Parser --> Producer[Target producer]
+  Producer --> Raw[rawJobs]
+  Raw --> Router[Protocol router]
+  Router --> TCPQ[tcpJobs]
+  Router --> UDPQ[udpJobs]
+  TCPQ --> TCP[TCP worker pool]
+  UDPQ --> UDP[Selected UDP worker pool]
+  TCP --> Results[Positive ScanResults]
+  UDP --> Results
+  Results --> Current[Temporary observation persister]
+  Current <--> Bolt[(schema-v1 scoped state)]
+
+  Producer -. producerErr .-> Completion[Scanner completion]
+  Router -. routerErr .-> Completion
+  UDP -. workerErr .-> Completion
+  TCP -. workersDone .-> Completion
+  UDP -. workersDone .-> Completion
+
+  Current -. stateErr .-> Final[Final scan completion]
+  Completion --> Final
+  Final --> Reconcile[FinalizeCurrentScan]
+  Reconcile --> Bolt
+  Reconcile --> CLI[stderr completion reporting]
+
   TCP -. diagnostics .-> Stderr[stderr]
   UDP -. diagnostics .-> Stderr
+  Current -. diagnostics .-> Stderr
+
+  ScopeDef[ScanScope.ID] --> Bolt
+  ServiceDef[ServiceIdentity.Key v1] --> Bolt
 ```
+
+Verified Phase B completion behaviour:
+
+- `scanner.Run` exposes the result stream and a separate asynchronous `ScanCompletion` channel;
+- result-channel closure proves result production has ended, but does not by itself prove scan success;
+- producer errors distinguish cancellation, target parse failure, and target-resolution failure;
+- router cancellation is propagated rather than discarded;
+- worker-level failure can make the scan incomplete when intended work cannot be executed;
+- every observation is offered to temporary persistence and the first persistence failure remains sticky;
+- the CLI combines scanner completion with temporary-state persistence before finalization;
+- `ScanCompletion.Successful()` is true only for `completed` with no error.
+
+Current limitations relevant to Phase B:
+
+- workers still emit positive observations only;
+- stdout is intentionally empty until B7 defines lifecycle-event serialization;
+- orphan temporary scans remain isolated and unpromotable but may consume storage until B6-M1 defines cleanup;
+- legacy `StateManager` code remains available in the scanner package but is unreachable from the production CLI;
+- UDP blocking reads remain deadline-bound and may not react immediately to cancellation.
+
+### 3.2 Target lifecycle vertical slice
+
+**Status: planned.**
+
+```mermaid
+flowchart LR
+  Scope[Canonical scan scope] --> Scan[Completed scan observation set]
+  Previous[(Committed baseline for scope)] --> Reconcile[Lifecycle reconciliation]
+  Scan --> Reconcile
+  Reconcile --> Commit[Atomic baseline commit]
+  Commit --> Events[service.opened / changed / closed / reopened]
+  Events --> Wazuh[Wazuh detection]
+  Wazuh --> Indexer[Wazuh Indexer / OpenSearch]
+  Indexer --> Dashboard[Exposure and remediation analytics]
+
+  Failed[Cancelled, failed, or incomplete scan] -. discard current set .-> Previous
+```
+
+A cancelled, failed, partial, or unresolved scan must preserve the previous committed baseline and must not generate `service.closed`.
+
+## 3.3 Phase B implementation progress
+
+Phase B is being built incrementally so identity and lifecycle rules are verified before they are connected to persistent reconciliation.
+
+| Workstream | Result | Status |
+|---|---|---|
+| **B1: Trace current data flow** | Traced CLI input, target parsing/resolution, dispatch, TCP/UDP workers, results channel, state manager, bbolt updates, and current output. Confirmed that positive-only observations and channel closure are insufficient to prove a successful complete scan. | Complete analysis |
+| **B2: Define lifecycle and identity contracts** | Defined `service.opened`, `service.changed`, `service.closed`, `service.reopened`, temporary current-scan state, committed baseline semantics, and the successful-scan commit rule. The original `finding_id` proposal was later deferred during B4. | Complete on paper |
+| **B3: Stable scan-scope identity** | Implemented and unit-tested deterministic `ScanScope.ID()` from canonical targets plus separate TCP/UDP port sets. | Runtime-active and verified |
+| **B4: Stable service identity** | Implemented and unit-tested deterministic `ServiceIdentity.Key()` from `scope_id`, canonical IP, port, and protocol. | Runtime-active and verified |
+| **B5: Explicit scan completion** | Implemented `ScanCompletion`, explicit failure statuses, producer/router/worker outcome propagation, sticky state-manager failure reporting, asynchronous completion from `Run`, and final CLI success gating. | Implemented and verified |
+| **B6: Versioned state and reconciliation** | Implemented schema-v1 metadata, scoped baseline/current storage, identity-bearing records, successful-scan-gated reconciliation, atomic promotion, incomplete-scan discard, restart/schema verification, and complete CLI lifecycle orchestration. | Complete, runtime-active, and verified |
+
+The active Phase B identity chain is now:
+
+```text
+scope_id -> service_key -> event_id
+```
+
+`finding_id` is deliberately deferred. It will be introduced only if one service can own multiple independent security findings rather than one lifecycle history.
+
+B5 provides the trustworthy scan-level success/failure boundary required before absence can be used as lifecycle evidence. B6 now implements and tests the state-side safety boundary, including successful-completion gating. B6.10 is the state-subsystem verification and gap-audit checkpoint. B6.11 owns runtime lifecycle-state integration, and B6.12 owns final cumulative verification and documentation closure.
+
+B6.11.1-B6.11.9 provide shared target tokenization, replay spooling, an explicit pre-B7 output boundary, pre-ownership schema enforcement, collision-safe scan reservation, complete observation mapping, order-independent result/completion coordination, orphan isolation, and executable integration. `main` directly calls this boundary.
 
 ## 4. Major components
 
 ### 4.1 Input source selection
 
-Target input may originate from a positional target, local file, standard input, or an authorized remote list. Input-source selection must be explicit and mutually unambiguous.
+Target input may originate from a positional target, local file, standard input, or an authorised remote list. Input-source selection must be explicit and mutually unambiguous.
 
-Required behavior:
+Required behaviour:
 
 - reject multiple conflicting sources;
 - reject excessive positional arguments;
@@ -61,53 +148,65 @@ Required behavior:
 
 ### 4.2 Streaming parser
 
-The parser reads through `io.Reader` and produces normalized scan jobs. CIDR expansion should occur incrementally so producer memory remains bounded.
+The parser reads through `io.Reader` and produces scan jobs. Large individual CIDRs should eventually be expanded incrementally so producer memory remains bounded.
 
-The parser is subject to backpressure. When work queues fill, parsing pauses until workers consume jobs. This prevents a fast producer from manufacturing millions of queued objects that contribute nothing except an eventual meeting with the OOM killer.
+The parser is subject to backpressure. When work queues fill, parsing pauses until workers consume jobs.
+
+B5 changed target production from a fire-and-forget operation into an explicit producer outcome. `StreamTargets` now returns an error and preserves these scan-level conditions:
+
+- context cancellation;
+- target parse/job-production failure;
+- target-resolution failure;
+- underlying input-reader failure, classified under the parse/production boundary;
+- `nil` when target production completes successfully.
+
+Target parse or resolution failure does not necessarily stop all remaining valid work. The producer may continue scanning valid targets while retaining the first failure so the overall scan is still classified as incomplete. Cancellation is propagated immediately.
+
+The producer-side send path checks `ctx.Err()` before a context-aware channel send. This avoids a race where an already-cancelled context and an available buffered send are both ready and Go's `select` would otherwise be free to choose the send.
 
 ### 4.3 Dispatcher and worker pools
 
 The dispatcher routes jobs to protocol-specific worker pools.
 
-- TCP workers use full-connect scanning through cancellable dials.
-- UDP workers send selected protocol-aware payloads and classify replies conservatively.
+- TCP workers use full-connect scanning through context-aware dials.
+- UDP workers send selected protocol-aware payloads and classify positive replies conservatively.
 - Channel direction types document ownership and prevent accidental misuse.
-- `sync.WaitGroup` and channel-closure ownership are centralized.
+- `sync.WaitGroup` and channel-closure ownership are centralised.
 - Worker counts are validated and bounded.
+
+B5 makes asynchronous stage outcomes explicit:
+
+- `startTargetProducer` owns `rawJobs` closure and publishes one producer error result;
+- `startJobRouter` owns `tcpJobs` and `udpJobs` closure and publishes one router error result;
+- worker completion is signalled separately from result-channel closure;
+- worker failures are captured without blocking error-reporting goroutines;
+- `startScannerCompletion` combines producer, router, worker, context, and worker-termination evidence into one scanner-level completion result.
+
+Unsupported UDP work is no longer silently skipped. If an intended UDP port has no supported payload, the UDP worker records a worker-level failure, continues draining queued jobs so the router cannot be stranded, and returns the retained error when its job channel closes.
+
+Ordinary probe failures remain per-service outcomes rather than scan-level worker failures. TCP connection failures, TLS/banner failures, UDP silence, and similar network conditions do not automatically produce `worker_failed`.
 
 Concurrency controls the number of simultaneous operations. The rate limiter controls how quickly new probes begin. These are separate dimensions.
 
 ### 4.4 Network operations
 
-All socket operations require deadlines and context cancellation.
+Socket operations require deadlines. TCP dials use the shared context. UDP cancellation still needs explicit review because the current UDP read path is deadline-bound rather than directly context-aware. B5 ensures an eventual cancellation is not reported as successful completion, but cancellation responsiveness can still be delayed until the UDP deadline expires.
 
-TCP results distinguish stable states from operational errors:
-
-- successful connection: `open`;
-- connection refused: generally `closed`;
-- timeout or no response: `unknown` or a carefully defined timeout state;
-- unreachable network, DNS failure, and cancellation: scanner or target-resolution errors.
-
-A timeout alone must not be presented as proof of firewall filtering.
+TCP observations distinguish established connections from operational failure. A timeout alone must not be presented as proof of firewall filtering or service closure.
 
 UDP classification is protocol-dependent and more uncertain. Positive application responses are stronger evidence than silence.
 
 ### 4.5 Protocol metadata
 
-HTTP handlers may send a bounded request to client-first services. TLS handlers may use SNI when a hostname is available and collect:
+HTTP handlers may send a bounded request to client-first services. TLS handlers may use SNI when a hostname is available and collect available certificate metadata.
 
-- certificate subject and issuer;
-- SANs;
-- negotiated TLS version;
-- cipher suite;
-- validity period;
-- verification result.
+Current metadata support and later enrichment must remain distinct. Negotiated TLS version, cipher suite, validity period, and verification result belong to later verified work unless supported by tests on the active branch.
 
-Reads and banners must be size-limited. Raw server content is untrusted input and must not be allowed to produce unbounded events.
+Reads and banners must be size-limited. Raw server content is untrusted input and must not produce unbounded events.
 
 ### 4.6 Observation normalization
 
-Internal worker structures are not serialized directly. A dedicated event model isolates the public telemetry contract from implementation details.
+Internal worker structures should not become the long-term public telemetry contract. A dedicated event model will isolate lifecycle events from implementation details.
 
 Stable comparison inputs may include:
 
@@ -117,35 +216,214 @@ Stable comparison inputs may include:
 - service state;
 - normalized service name;
 - bounded normalized banner;
-- certificate fingerprint or stable certificate fields.
+- certificate fingerprint or selected stable certificate fields.
 
-Unstable fields must not influence state hashes:
+Unstable fields must not influence observation fingerprints:
 
 - scan timestamp;
 - latency;
 - event ID;
 - temporary OS error text;
-- worker or rate settings.
+- worker, rate, or timeout settings.
 
-### 4.7 State manager and bbolt
+### 4.7 Stable scan-scope identity
 
-Workers never write directly to bbolt. They send normalized observations to a single state-manager goroutine.
+**Status: implemented, runtime-active, and verified.**
 
-The database requires a versioned schema with metadata such as:
+`internal/scanner/scope.go` defines `ScanScope` and derives a deterministic ID from a versioned canonical representation containing:
+
+- normalized target definitions;
+- a deduplicated and sorted TCP port set;
+- a deduplicated and sorted UDP port set.
+
+Separate TCP and UDP port lists encode the protocol dimension, so TCP port 53 and UDP port 53 produce different scope identities.
+
+Target canonicalization currently:
+
+- trims surrounding whitespace;
+- lowercases hostnames and removes a trailing dot;
+- masks CIDRs to their network prefix;
+- canonicalizes IPv4 and IPv6 text through `net/netip`;
+- unmapped IPv4-mapped IPv6 addresses to their IPv4 form.
+
+The canonical value is serialized as JSON and hashed with SHA-256. The schema version is included in the canonical value so future identity changes can be explicit rather than silently reinterpreting prior IDs.
+
+The following execution settings are intentionally excluded:
+
+- worker count;
+- rate limit;
+- timeout;
+- timestamps;
+- scan duration;
+- scan ID.
+
+Canonicalization builds new slices before sorting, so `ID()` does not mutate caller-owned target or port slices.
+
+Verified tests cover:
+
+- reordered and duplicated equivalent inputs producing the same ID;
+- changed targets producing a different ID;
+- changed TCP or UDP port sets producing a different ID;
+- TCP and UDP separation;
+- execution settings not affecting identity;
+- hostname, CIDR, IPv6, and whitespace normalization;
+- absence of caller-slice mutation.
+
+The CLI derives this identity from the prepared logical targets and configured TCP/UDP ports before reserving temporary scan state. Reconciliation and promotion remain confined to that scope.
+
+### 4.8 Stable service identity
+
+**Status: implemented, runtime-active, and persistently verified.**
+
+`internal/scanner/service_identity.go` defines `ServiceIdentity` with exactly four identity inputs:
+
+- `scope_id`;
+- IP address;
+- port;
+- protocol.
+
+The service key answers: **which network service within this stable scan scope is being observed?** A target may therefore own multiple service keys, for example TCP/22, TCP/443, and UDP/53.
+
+The identity rules are:
+
+- `scope_id` must not be empty;
+- IP text must parse with `netip.ParseAddr`;
+- equivalent IPv6 forms are canonicalized through `netip.Addr.String()`;
+- IPv4-mapped IPv6 is unmapped so `::ffff:192.0.2.10` and `192.0.2.10` share an identity;
+- protocol must already be canonical and exactly `tcp` or `udp`;
+- port must be within `1..65535`.
+
+The canonical representation is versioned, serialized as JSON, hashed with SHA-256, and encoded as lowercase hexadecimal.
+
+The following values are deliberately excluded from service identity:
+
+- target hostname or display name;
+- banner and service metadata;
+- TLS metadata;
+- service state;
+- scan ID;
+- timestamps and latency;
+- worker, rate, and timeout settings.
+
+Verified tests cover:
+
+- identical service input producing the same key;
+- different IP, port, protocol, or scope producing different keys;
+- TCP and UDP separation on the same numbered port;
+- equivalent IPv6 representations;
+- IPv4-mapped IPv6 equivalence;
+- invalid IP rejection;
+- strict `tcp`/`udp` protocol validation;
+- invalid port rejection and valid boundary acceptance;
+- empty scope-ID rejection.
+
+The persistent `service_key` v1 derivation is frozen by a fixed known-vector compatibility test. Any future representation change requires an explicit compatibility or migration boundary so a serialization refactor cannot manufacture false `closed` and `opened` transitions.
+
+The runtime observation adapter constructs `ServiceIdentity` from each `ScanResult` plus the owned scope, and persistence recomputes and validates the key when records are loaded.
+
+### 4.9 Explicit scan completion
+
+**Status: implemented and verified.**
+
+B1 established that result-channel closure only proves that result-producing workers exited. B5 therefore introduced a separate scan-level completion result before lifecycle reconciliation is allowed to treat missing observations as evidence.
+
+The core model is:
+
+```go
+type ScanCompletion struct {
+    Status ScanStatus
+    Err    error
+}
+```
+
+`Successful()` is intentionally strict:
+
+```text
+Status == completed
+AND
+Err == nil
+```
+
+Current status vocabulary:
+
+- `completed`;
+- `cancelled`;
+- `resolution_failed`;
+- `parse_failed`;
+- `worker_failed`;
+- `state_failed`.
+
+The scanner-side completion path combines:
+
+```text
+producer outcome
++ router outcome
++ worker outcome
++ worker termination
++ context state
+= scanner completion
+```
+
+`scanner.Run` returns both the observation stream and an asynchronous completion channel. The completion path does not block normal result consumption.
+
+The CLI combines scanner completion with temporary-observation persistence outcome:
+
+```text
+scanner completion + stateErr = final scan completion
+```
+
+Rules:
+
+- scanner success + state success -> `completed`;
+- scanner success + state failure -> `state_failed`;
+- scanner failure + state success -> preserve scanner failure;
+- scanner failure + state failure -> preserve the scanner status and retain both diagnostic errors;
+- missing or internally inconsistent completion evidence fails closed.
+
+Cancellation remains authoritative over worker errors caused by the same cancelled context. Producer parse and resolution errors retain their specific classifications. A worker failure is used only when intended work cannot be completed, not for ordinary network-probe failure.
+
+B5 verification includes focused tests, 100 repeated completion/worker test runs, race-enabled scanner and CLI tests, `go vet ./...`, `git diff --check`, and the full repository test suite.
+
+B5 provides the authorization signal for baseline promotion. It does not itself implement lifecycle baseline replacement. B6 must require `ScanCompletion.Successful() == true` before a temporary current-scan observation set can become the committed baseline.
+
+### 4.10 Lifecycle state and bbolt
+
+**Current status: the versioned lifecycle store is active in the CLI.**
+
+Workers do not write directly to bbolt. Runtime orchestration consumes results and writes them to the owned temporary scan partition.
+
+B5 changed the state-manager boundary from an open-port count only to an explicit persistence outcome:
+
+```text
+runtime observation persistence -> sticky stateErr
+```
+
+Persistence-error behaviour is deliberately sticky:
+
+1. every observation receives a persistence attempt;
+2. the first persistence failure remains authoritative;
+3. later persistence failures do not replace it;
+4. result drainage continues until writers are quiescent;
+5. finalization receives `state_failed` and cannot promote the temporary scan.
+
+Continuing to drain results after persistence failure is a concurrency-safety requirement. Returning immediately could leave scanner workers blocked while sending into `results`, preventing their `WaitGroup` from completing and preventing scan completion from resolving.
+
+Schema v1 uses this lifecycle layout:
 
 ```text
 metadata/schema_version
 metadata/created_at
-scope/<scope_id>/baseline/...
-scope/<scope_id>/scan/<scan_id>/...
-finding/<finding_id>/...
+scope/<scope_id>/baseline/<service_key>/...
+scope/<scope_id>/scan/<scan_id>/<service_key>/...
 ```
 
-State keys include protocol, address, and port. TCP and UDP observations for the same numbered port are separate services.
+Baseline and temporary current-scan records are keyed by stable `service_key` within `scope_id`. TCP and UDP observations for the same numbered port are separate services. Unknown, incomplete, malformed, and legacy schemas are explicitly rejected before scanner startup.
 
 ## 5. Lifecycle reconciliation
 
-Hash suppression alone detects first-seen or changed open observations, but cannot reliably detect service closure. Complete lifecycle tracking compares a finished scan with the previous committed baseline.
+**Status: implemented, runtime-active, and verified.**
+
+Hash suppression alone detects first-seen or changed positive observations, but cannot reliably detect service closure. Complete lifecycle tracking compares a successfully finished scan with the previous committed baseline for the same scope.
 
 ```text
 current - previous                         = opened
@@ -156,34 +434,55 @@ previously closed and observed again       = reopened
 
 ### 5.1 Commit rule
 
-A scan baseline may be committed only when:
+B5 now implements the authorization signal for baseline promotion. B6 must treat this as a hard gate:
 
-- all intended target and port jobs were produced;
-- worker processing completed;
+```text
+ScanCompletion.Successful() == true  -> baseline promotion may proceed
+ScanCompletion.Successful() == false -> baseline promotion forbidden
+```
+
+A scan can be successful only when:
+
+- target production completed without an incomplete-scope parse or resolution failure;
+- routing completed;
+- intended worker processing completed without a scan-level worker failure;
 - the process was not cancelled;
-- no fatal parser or state error made the scan incomplete.
+- state persistence completed without error.
 
-Temporary observations are discarded after incomplete scans. This invariant prevents a network outage or Ctrl+C from being celebrated as successful remediation.
+B6's `FinalizeCurrentScan` owns the state transition: successful scans atomically reconcile and replace the committed baseline, while incomplete scans produce no changes and attempt targeted temporary-state discard. The CLI calls this boundary exactly once after result writers are quiescent.
+
+At runtime, results-channel closure may establish only that observation writers are quiescent. It does not establish scan success. The completion passed to `FinalizeCurrentScan` may be successful only when scanner completion is successful, the current-scan bucket was created successfully, every temporary observation write succeeded, and all writers have stopped. The current-scan bucket must be created even when the successful scan observes zero services.
+
+Temporary observations from incomplete scans must be discarded rather than promoted. This prevents outages, parser/resolution failures, worker failures, persistence failures, or Ctrl+C from being reported as successful remediation.
+
+B6.11 initializes schema v1 before scan ownership and explicitly refuses legacy `PortStates` databases. Returned `ServiceChange` values remain internal until B7; runtime integration emits no lifecycle events prematurely.
+
+The B6.11 output boundary deliberately retires the legacy `port_state_delta` format without replacement: stdout is intentionally empty in both JSON and non-JSON modes until B7. Start, completion, failure, cancellation, and debug diagnostics remain on stderr.
 
 ### 5.2 Stable identifiers
 
-- `scan_id`: unique to one execution;
-- `scope_id`: stable hash of normalized targets, ports, and protocols;
-- `finding_id`: stable identity of a service finding within a scope;
-- `event.id`: unique lifecycle event identifier.
+| Identifier | Contract | Current status |
+|---|---|---|
+| `scan_id` | Unique to one execution | Runtime-generated 128-bit lowercase hexadecimal ID with exclusive reservation |
+| `scope_id` | Stable hash of canonical targets plus separate TCP and UDP port sets | Runtime-active baseline partition |
+| `service_key` | Stable identity of one service within a scope: canonical IP + port + protocol under `scope_id` | Runtime-active persistent v1 key |
+| `event_id` | Unique identity of one lifecycle event | Planned |
+| `finding_id` | Separate security-finding identity | Deferred until one service can own multiple independent findings |
 
-Worker count, rate limit, timeout, timestamps, and duration do not belong in `scope_id`.
+The active Phase B identity chain is `scope_id -> service_key -> event_id`. Worker count, rate limit, timeout, timestamps, duration, banners, TLS metadata, and service state do not belong in stable service identity.
 
 ## 6. Event pipeline
 
-TcpRecon emits one versioned NDJSON object per event.
+**Current status:** Lifecycle changes remain internal, stdout is intentionally empty, and diagnostics belong on stderr.
+
+**Target status:** TcpRecon emits one versioned NDJSON object per lifecycle or operational event.
 
 ```text
-stdout → events only
+stdout → telemetry only
 stderr → diagnostics only
 ```
 
-The lifecycle vocabulary is:
+The planned lifecycle vocabulary is:
 
 - `service.opened`
 - `service.changed`
@@ -191,11 +490,13 @@ The lifecycle vocabulary is:
 - `service.reopened`
 - optional operational events such as `scan.failed`
 
-The canonical schema is defined in [`docs/EVENT_SCHEMA.md`](./docs/EVENT_SCHEMA.md).
+The canonical lifecycle schema will be documented in `docs/EVENT_SCHEMA.md` when its fields and semantics are implemented and verified.
 
 ## 7. Wazuh integration
 
-Wazuh reads the event file using a JSON `<localfile>` configuration. Repository-owned integration assets should be arranged as:
+**Status: planned and dependent on verified lifecycle events.**
+
+Wazuh will read the event file using a JSON `<localfile>` configuration. Repository-owned integration assets should be arranged as:
 
 ```text
 deployments/wazuh/
@@ -222,11 +523,13 @@ Rule design should separate:
 4. asset context;
 5. risk escalation.
 
-An open SSH port is not automatically a critical incident. Severity depends on whether the service is approved, exposed, vulnerable, newly introduced, or located on a critical asset.
+An open SSH port is not automatically a critical incident. Severity depends on context such as approval, exposure, vulnerability, change status, and asset criticality.
 
 Every fixture must be tested with `wazuh-logtest` before manager restart.
 
 ## 8. OpenSearch analytics
+
+**Status: planned and dependent on reproducible Wazuh ingestion.**
 
 Dashboard-critical fields require explicit mappings:
 
@@ -239,7 +542,7 @@ Dashboard-critical fields require explicit mappings:
 | owner, environment, criticality | `keyword` |
 | explanations and long banners | `text` plus bounded keyword fields only where justified |
 
-Numeric fields already support disk-backed aggregations. They should not be forced into `.keyword` mappings. FieldData should not be enabled merely to make an analyzed text field aggregate.
+Numeric fields should not be forced into `.keyword` mappings. FieldData should not be enabled merely to aggregate analyzed text.
 
 Planned dashboards include current exposure, service changes, unresolved risk, deprecated TLS, certificate expiry, and remediation duration.
 
@@ -247,7 +550,9 @@ Planned dashboards include current exposure, service changes, unresolved risk, d
 
 ### 9.1 Container
 
-The container uses a multi-stage build and a minimal runtime:
+**Status: repository baseline exists; current runtime verification should be recorded separately.**
+
+The intended container uses a multi-stage build and a minimal runtime:
 
 - static Go binary;
 - no shell or package manager;
@@ -258,6 +563,8 @@ The container uses a multi-stage build and a minimal runtime:
 
 ### 9.2 Kubernetes
 
+**Status: repository baseline exists; lifecycle safety is not complete.**
+
 Scheduled execution uses a CronJob with:
 
 - `concurrencyPolicy: Forbid`;
@@ -266,17 +573,17 @@ Scheduled execution uses a CronJob with:
 - resource requests sized for the lab;
 - bounded scan scope and frequency.
 
-bbolt's exclusive file lock makes overlapping writers invalid by design, not merely inconvenient.
+bbolt's exclusive file lock makes overlapping writers invalid by design.
 
 ### 9.3 Wazuh lab baseline
 
-The current lab baseline is a dedicated Ubuntu Server 24.04 LTS host with constrained hardware. The deployment should remain small, use short retention, and avoid enabling expensive workloads until the core manager, indexer, dashboard, and Filebeat services are stable.
+**Status: deployment target, not evidence that the stack is currently running.**
 
-Version-specific installation instructions belong in deployment documentation because supported versions change. Architecture should describe invariants, not fossilize one afternoon's package versions.
+The planned lab baseline is a dedicated Ubuntu Server 24.04 LTS host with constrained hardware. Deployment status, package versions, and installation commands belong in operations or status documentation because they change independently of scanner architecture.
 
 ## 10. CI/CD and GitOps
 
-Pull requests and pushes should run:
+Pull requests and pushes should verify:
 
 ```bash
 gofmt verification
@@ -286,46 +593,61 @@ go test -race ./...
 go build ./cmd/tcprecon
 ```
 
-Release automation may build and publish immutable OCI images to GHCR. Production hosts pull versioned images and do not compile or edit source code directly.
-
-Generated binaries, credentials, local state databases, certificates, and password archives must not be committed.
+Release automation may build immutable OCI images. Generated binaries, credentials, local state databases, certificates, and password archives must not be committed.
 
 ## 11. Security boundaries
 
-- The scanner operates only within explicit authorized scope.
+- The scanner operates only within explicit authorised scope.
 - Remote target lists are untrusted input and require HTTPS, size limits, timeouts, and validation.
 - Banners and certificate fields are untrusted and must be bounded before logging.
-- Secrets for GHCR, Wazuh, Slack, or other integrations remain outside Git.
+- Secrets for registries, Wazuh, Slack, or other integrations remain outside Git.
 - Rate limiting protects local and target resources; it is not an evasion mechanism.
-- Telemetry integrity matters because malformed or mixed stdout can corrupt downstream detection.
+- Telemetry integrity matters because mixed stdout can corrupt downstream detection.
 
 ## 12. Verification strategy
 
-### Unit tests
+### 12.1 Verified identity foundations
 
-- port and protocol parsing;
-- target and input-source parsing;
-- CIDR iteration;
-- state-key construction;
-- normalized hashing;
-- event serialization;
-- lifecycle-set reconciliation;
-- risk-score boundaries.
+B3 scope identity:
 
-### Local integration tests
+```bash
+go test -count=1 ./internal/scanner -run ScanScope
+```
+
+B4 service identity:
+
+```bash
+go test -count=1 ./internal/scanner -run 'TestServiceIdentityKey'
+```
+
+Package verification used for both checkpoints:
+
+```bash
+go test -count=1 ./internal/scanner
+go test -race -count=1 ./internal/scanner
+go vet ./internal/scanner
+git diff --check
+```
+
+These checks verify deterministic scope identity, deterministic service identity, IP canonicalization, TCP/UDP separation, validation behavior, and absence of scope-input mutation. They do not prove runtime integration, persistent compatibility, successful scan completion, or lifecycle reconciliation.
+
+### 12.2 B6 state verification
+
+Verified coverage includes the fixed persistent `service_key` v1 vector, schema metadata and incompatibility handling, scope/scan partitioning, strict persistent records, lifecycle reconciliation, successful atomic promotion, incomplete-scan discard, TCP/UDP separation, and close/reopen durability. Event serialization remains B7 work.
+
+### 12.3 Local integration tests
 
 - loopback TCP listener;
 - closed local port;
-- local HTTP test server;
-- local TLS test server;
+- local HTTP and TLS test servers;
 - selected UDP responders;
 - deadline and cancellation behavior;
 - stdout/stderr separation;
 - database restart and migration behavior.
 
-### End-to-end lab test
+### 12.4 Target end-to-end lab test
 
-1. Start an authorized lab service.
+1. Start an authorised lab service.
 2. Complete a scan and emit `service.opened`.
 3. Repeat the scan and emit no duplicate lifecycle event.
 4. Change the service and emit `service.changed`.
@@ -343,10 +665,10 @@ Until the vertical slice is complete, the project will not prioritize:
 - broad vulnerability detection;
 - Internet-wide scanning;
 - complex multi-tenant dashboards;
-- claims of C10k, million-socket, or fixed per-worker memory performance without reproducible benchmarks.
+- performance claims without reproducible benchmarks.
 
 ## 14. Historical evolution
 
-The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based state suppression, and expanded into container, Kubernetes, Wazuh, and OpenSearch workflows.
+The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based observation suppression, and added container and Kubernetes deployment baselines. Phase B has since traced lifecycle failure paths and activated stable scope/service identity, versioned state, safe reconciliation, and successful-scan-only baseline promotion in the CLI.
 
-Those milestones explain the design, but historical implementation anecdotes do not override the current contracts documented here.
+Wazuh detection, OpenSearch analytics, complete lifecycle reconciliation, and remediation tracking remain target work until they have reproducible implementation evidence.

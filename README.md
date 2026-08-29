@@ -1,10 +1,10 @@
 # TcpRecon
 
-TcpRecon is a Go-based network attack-surface monitoring project for authorized environments. It combines controlled TCP and selected UDP probing, application and TLS metadata collection, persistent state comparison, NDJSON telemetry, and planned Wazuh/OpenSearch integration.
+TcpRecon is a Go-based network attack-surface monitoring project for authorized environments. It combines controlled TCP and selected UDP probing, application and TLS metadata collection, versioned lifecycle state, and planned NDJSON/Wazuh/OpenSearch integration.
 
 The project is intentionally scoped as a reproducible security-engineering platform, not a replacement for mature scanners such as Nmap or enterprise vulnerability-management products. Its value is the complete pipeline from observation to state change, detection, analysis, and remediation evidence.
 
-> **Project status:** active development. Core scanning, structured output, state storage, containerization, and orchestration foundations exist. CLI correctness, lifecycle reconciliation, reproducible Wazuh deployment, and risk analytics are being hardened before a stable release.
+> **Project status:** active development. Core scanning and schema-v1 lifecycle reconciliation are runtime-active. Lifecycle-event output is deferred to B7, so the current CLI intentionally emits no stdout records.
 
 ## Why this project exists
 
@@ -19,9 +19,9 @@ bounded TCP and UDP worker pools
         ↓
 HTTP, TLS, and protocol metadata
         ↓
-single-writer state comparison
+scope-partitioned lifecycle reconciliation
         ↓
-atomic NDJSON events
+versioned lifecycle events (B7)
         ↓
 Wazuh detection and OpenSearch analytics
 ```
@@ -35,8 +35,8 @@ Wazuh detection and OpenSearch analytics
 | Rate limiting | Implemented | Controls probe starts independently from worker concurrency. |
 | HTTP and TLS metadata | Implemented | Includes banner and certificate metadata where available. |
 | Target streaming | Partially implemented | File, standard input, and remote-source support exist; large-range behavior is being hardened. |
-| NDJSON output | Implemented | Machine-readable events on `stdout`; diagnostics belong on `stderr`. |
-| Persistent state | Implemented, incomplete lifecycle | bbolt and xxHash suppress unchanged observations; complete opened/closed/reopened reconciliation is in progress. |
+| NDJSON output | Pending B7 | Stdout is intentionally empty in both output modes; diagnostics remain on `stderr`. |
+| Persistent state | Implemented | Schema-v1 bbolt state supports scoped opened/changed/closed/reopened reconciliation and successful-scan-only atomic promotion. |
 | Container image | Implemented | Multi-stage static build with a minimal unprivileged runtime. |
 | Kubernetes CronJob | Implemented | Uses persistent storage and non-overlapping execution. |
 | Wazuh integration | Rebuild in progress | Configuration is being converted from host-local changes into version-controlled deployment assets. |
@@ -87,7 +87,24 @@ For a list of lab targets:
 ./tcprecon -p 22,80,443 -iL targets.txt
 ```
 
-Separate events from diagnostics:
+IPv6 and CIDR targets are also accepted directly:
+
+```bash
+./tcprecon -p 22,80,443 ::1
+./tcprecon -p 22,80,443 127.0.0.0/30
+```
+
+Target lists may also come from stdin or an HTTP(S) URL:
+
+```bash
+printf '127.0.0.1\n::1\n' | ./tcprecon -p 22,80,443
+./tcprecon -p 22,80,443 https://example.internal/authorized-targets.txt
+```
+
+Choose one explicit input source: a positional target/URL or `-iL`. If neither
+is supplied, piped stdin is used before the `TARGET_URL` environment fallback.
+
+Capture the current output streams:
 
 ```bash
 ./tcprecon -j -p 22,80,443 127.0.0.1 \
@@ -95,7 +112,7 @@ Separate events from diagnostics:
   2> diagnostics.log
 ```
 
-Validate the event stream:
+During the B6-only checkpoint, `events.ndjson` is intentionally empty. Event-stream validation applies after B7 enables serialization:
 
 ```bash
 jq -c . < events.ndjson
@@ -103,18 +120,18 @@ jq -c . < events.ndjson
 
 ## Output contract
 
-TcpRecon follows a strict stream contract:
+TcpRecon currently follows this temporary B6 stream contract:
 
-- `stdout`: NDJSON security events only
+- `stdout`: intentionally empty until B7
 - `stderr`: diagnostics, progress, warnings, and internal errors
 
-Each line on `stdout` represents one observation or lifecycle event. Aggregate documents containing arrays of ports are deliberately avoided because atomic events are easier to validate, ingest, correlate, and replay.
+The legacy `port_state_delta` output is retired and raw scan observations are not emitted as a replacement. B7 will define and activate versioned lifecycle-event serialization.
 
 A simplified event shape is documented in [`docs/EVENT_SCHEMA.md`](./docs/EVENT_SCHEMA.md).
 
 ## Stateful monitoring
 
-TcpRecon uses bbolt as an embedded state store and xxHash for fast comparison of normalized service observations. A dedicated state-manager goroutine owns database writes, preventing network workers from fighting over disk locks like humans around the final charging socket.
+TcpRecon uses bbolt schema v1 as an embedded lifecycle store. State is partitioned by canonical `scope_id`, with temporary observations owned by a unique `scan_id` and committed records keyed by stable `service_key`.
 
 The target lifecycle model is:
 
@@ -124,6 +141,8 @@ The target lifecycle model is:
 - `service.reopened`
 
 Only a successfully completed scan may replace a committed baseline. Cancelled or partial scans must never create false closure events.
+
+Existing unversioned databases, including legacy databases containing `PortStates`, are refused rather than silently reinterpreted. Use a fresh database path or perform an explicitly designed migration when one becomes available.
 
 ## Deployment
 
@@ -163,8 +182,9 @@ Tests should use loopback listeners, temporary files, and Go test servers. Autom
 - The scanner is not a vulnerability scanner and does not prove exploitability.
 - A timeout does not always prove that a port is filtered.
 - UDP state classification is inherently less certain than TCP full-connect results.
-- IPv6 and very large CIDR behavior must be verified against the current implementation.
-- Stateful closure detection is not trustworthy until full-scan reconciliation is complete.
+- Very large CIDRs expand in memory and should be avoided.
+- Lifecycle changes are reconciled and committed internally, but are not emitted until B7.
+- Orphan temporary scans remain isolated and unpromotable but may consume storage until the B6-M1 cleanup policy is implemented.
 - Performance claims require published, reproducible benchmarks. None are implied merely because Go contains goroutines.
 
 ## Legal and ethical use

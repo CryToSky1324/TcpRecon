@@ -2,15 +2,22 @@ package utils
 
 import (
 	"bufio"
-	"fmt"
-	"net"
-	"strings"
-	"io"
-	"net/http"
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/CryToSky1324/TcpRecon/internal/models" // Replace 'github.com/CryToSky1324/TcpRecon' with your actual go.mod module name
+)
+
+var (
+	ErrTargetParse      = errors.New("target parse failed")
+	ErrTargetResolution = errors.New("target resolution failed")
 )
 
 // FetchTargets streams the target list from an external HTTP/S3 endpoint.
@@ -35,56 +42,85 @@ func FetchTargets(ctx context.Context, targetURL string) (io.ReadCloser, error) 
 }
 
 // StreamTargets reads line-by-line, preventing heap exhaustion, and feeds the worker channel.
-func StreamTargets(ctx context.Context, r io.Reader, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) {
+func StreamTargets(ctx context.Context, r io.Reader, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) error {
+	var streamErr error
 	scanner := bufio.NewScanner(r)
+
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		line, keep := ParseTargetLine(scanner.Text())
+		if !keep {
 			continue
 		}
-
+		// CIDR target
 		if strings.Contains(line, "/") {
 			ips, err := expandCIDR(line)
 			if err != nil {
+				if streamErr == nil {
+					streamErr = fmt.Errorf("%w: invalid CIDR %q: %v", ErrTargetParse, line, err)
+				}
 				continue
 			}
+
 			for _, ip := range ips {
-				dispatchJobs(ctx, ip, line, tcpPorts, udpPorts, rawJobs)
+				if err := dispatchJobs(ctx, ip, line, tcpPorts, udpPorts, rawJobs); err != nil {
+					return err
+				}
 			}
 			continue
 		}
 
+		// Hostname / IP target
 		ips, err := net.LookupIP(line)
 		if err != nil {
+			if streamErr == nil {
+				streamErr = fmt.Errorf("%w: target %q: %v", ErrTargetResolution, line, err)
+			}
 			continue
 		}
 		for _, ip := range ips {
-			if ipv4 := ip.To4(); ipv4 != nil {
-				dispatchJobs(ctx, ipv4.String(), line, tcpPorts, udpPorts, rawJobs)
+			if err := dispatchJobs(ctx, ip.String(), line, tcpPorts, udpPorts, rawJobs); err != nil {
+				return err
 			}
 		}
 	}
+
+	if err := scanner.Err(); err != nil {
+		if streamErr == nil {
+			streamErr = fmt.Errorf("%w: target stream read failed: %v", ErrTargetParse, err)
+		}
+	}
+	return streamErr
 }
 
 // dispatchJobs pushes the generated structs into the routing channel with explicit protocol tags
-func dispatchJobs(ctx context.Context, ip string, targetName string, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) {
+func dispatchJobs(ctx context.Context, ip string, targetName string, tcpPorts []int, udpPorts []int, rawJobs chan<- models.ScanJob) error {
 	// 1. Dispatch TCP Vectors
 	for _, port := range tcpPorts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case rawJobs <- models.ScanJob{TargetIP: ip, TargetName: targetName, Port: port, Protocol: "tcp"}:
 		}
 	}
 
 	// 2. Dispatch UDP Vectors
 	for _, port := range udpPorts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case rawJobs <- models.ScanJob{TargetIP: ip, TargetName: targetName, Port: port, Protocol: "udp"}:
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // expandCIDR mathematically generates usable IPv4 addresses from a CIDR block (Unexported/Private to utils)
@@ -116,16 +152,23 @@ func incIP(ip net.IP) {
 }
 
 // ParsePortRange parses comma-separated ports and ranges (Exported)
-func ParsePortRange(portStr string) ([]int, error) { 
+func ParsePortRange(portStr string) ([]int, error) {
 	var ports []int
 	parts := strings.Split(portStr, ",")
 
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if strings.Contains(part, "-") {
-			var start, end int
-			_, err := fmt.Sscanf(part, "%d-%d", &start, &end)
+			bounds := strings.Split(part, "-")
+			if len(bounds) != 2 {
+				return nil, fmt.Errorf("invalid port range syntax: %s", part)
+			}
+			start, err := strconv.Atoi(strings.TrimSpace(bounds[0]))
 			if err != nil {
+				return nil, fmt.Errorf("invalid port range syntax: %s", part)
+			}
+			end, err := strconv.Atoi(strings.TrimSpace(bounds[1]))
+			if err != nil || start > end {
 				return nil, fmt.Errorf("invalid port range syntax: %s", part)
 			}
 			for p := start; p <= end; p++ {
@@ -135,8 +178,7 @@ func ParsePortRange(portStr string) ([]int, error) {
 				ports = append(ports, p)
 			}
 		} else {
-			var p int
-			_, err := fmt.Sscanf(part, "%d", &p)
+			p, err := strconv.Atoi(part)
 			if err != nil {
 				return nil, fmt.Errorf("invalid port syntax: %s", part)
 			}

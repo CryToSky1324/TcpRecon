@@ -15,7 +15,9 @@ import (
 )
 
 // StateManager consumes results and micro-batches them into bbolt to prevent fsync exhaustion.
-func StateManager(db *bbolt.DB, results <-chan models.ScanResult, jsonMode bool) int {
+func StateManager(db *bbolt.DB, results <-chan models.ScanResult, jsonMode bool) (int, error) {
+	var stateErr error
+
 	openPorts := 0
 	const maxBatchSize = 1000
 
@@ -27,9 +29,9 @@ func StateManager(db *bbolt.DB, results <-chan models.ScanResult, jsonMode bool)
 	defer ticker.Stop()
 
 	// Anonymous function to execute the monolithic transaction
-	flush := func(batch []models.ScanResult) {
+	flush := func(batch []models.ScanResult) error {
 		if len(batch) == 0 {
-			return
+			return nil
 		}
 
 		type deltaPayload struct {
@@ -87,7 +89,7 @@ func StateManager(db *bbolt.DB, results <-chan models.ScanResult, jsonMode bool)
 
 		if err != nil {
 			slog.Error("Failed to flush state batch to disk", slog.String("error", err.Error()))
-			return
+			return err
 		}
 
 		// 3. Strict UNIX stdout emission completely decoupled from DB locks
@@ -99,6 +101,7 @@ func StateManager(db *bbolt.DB, results <-chan models.ScanResult, jsonMode bool)
 				}
 			}
 		}
+		return nil
 	}
 
 	// Channel consumption routing
@@ -107,8 +110,12 @@ func StateManager(db *bbolt.DB, results <-chan models.ScanResult, jsonMode bool)
 		case result, ok := <-results:
 			if !ok {
 				// Channel closed by dispatcher: flush remaining buffer and exit Goroutine
-				flush(buffer)
-				return openPorts
+				if stateErr == nil {
+					if err := flush(buffer); err != nil {
+						stateErr = err
+					}
+				}
+				return openPorts, stateErr
 			}
 
 			if result.State == "OPEN" {
@@ -117,12 +124,19 @@ func StateManager(db *bbolt.DB, results <-chan models.ScanResult, jsonMode bool)
 
 			buffer = append(buffer, result)
 			if len(buffer) >= maxBatchSize {
-				flush(buffer)
-				buffer = buffer[:0] // Reslice to 0, retaining allocated capacity
+				if stateErr == nil {
+					if err := flush(buffer); err != nil {
+						stateErr = err
+					}
+				}
+				buffer = buffer[:0]
 			}
-
 		case <-ticker.C:
-			flush(buffer)
+			if stateErr == nil {
+				if err := flush(buffer); err != nil {
+					stateErr = err
+				}
+			}
 			buffer = buffer[:0]
 		}
 	}

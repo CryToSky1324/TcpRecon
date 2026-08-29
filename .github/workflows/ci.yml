@@ -64,7 +64,7 @@ jobs:
           CGO_ENABLED: 0 # Enforces static compilation
         run: |
           mkdir -p bin
-          go build -ldflags="-w -s" -o bin/tcprecon-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/tcprecon/main.go
+          go build -ldflags="-w -s" -o bin/tcprecon-${{ matrix.goos }}-${{ matrix.goarch }} ./cmd/tcprecon
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4

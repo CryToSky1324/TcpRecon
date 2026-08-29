@@ -39,7 +39,7 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 		}
 
 		// 3. Layer 4: Socket Initialization
-		address := fmt.Sprintf("%s:%d", job.TargetIP, job.Port)
+		address := joinHostPort(job.TargetIP, job.Port)
 		conn, err := dialer.DialContext(ctx, "tcp", address)
 		if err != nil {
 			if debug {
@@ -112,7 +112,7 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 			TargetName:  job.TargetName,
 			TargetIP:    job.TargetIP,
 			Port:        job.Port,
-			Protocol:		 "tcp",
+			Protocol:    "tcp",
 			State:       "OPEN",
 			Banner:      strings.TrimSpace(banner),
 			OSHint:      osHint,
