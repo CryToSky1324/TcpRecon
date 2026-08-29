@@ -4,6 +4,25 @@ import (
 	"testing"
 )
 
+func TestServiceIdentityKeyV1KnownVector(t *testing.T) {
+	identity := ServiceIdentity{
+		ScopeID:  "scope-test",
+		IP:       "192.0.2.10",
+		Port:     443,
+		Protocol: "tcp",
+	}
+
+	got, err := identity.Key()
+	if err != nil {
+		t.Fatalf("Key() error = %v", err)
+	}
+
+	const want = "1093d4118dd533702fb0c83e16ac0c1a3abca13646e8beede8b9fcabbbcfcb7c"
+	if got != want {
+		t.Fatalf("Key() = %q, want persistent service_key v1 %q", got, want)
+	}
+}
+
 func TestServiceIdentityKeyStableForSameService(t *testing.T) {
 	first := ServiceIdentity{
 		ScopeID:  "scope-test",

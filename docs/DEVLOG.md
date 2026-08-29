@@ -621,3 +621,139 @@ Fail-fast is not always safe in a producer/consumer pipeline. Sometimes the corr
 Tests that pass once are not sufficient evidence for cancellation-sensitive code. Repeated focused tests exposed a real scheduling-dependent bug that ordinary single-run testing missed.
 
 B5 also reinforced the architectural separation between authorization and persistence: completion decides whether a baseline commit is allowed; B6 must implement the commit itself.
+
+-------------------------------------------------------------------------------------
+
+## 2026-08-28: B6.1-B6.10 — Versioned Lifecycle State Subsystem
+
+### Goal
+
+Build and verify the state-side lifecycle boundary before replacing the active CLI persistence path.
+
+### Work completed
+
+- froze persistent `service_key` v1 with a fixed known vector;
+- added schema-v1 `metadata/schema_version` and `metadata/created_at`;
+- explicitly rejected unknown, incomplete, malformed, and legacy schemas;
+- partitioned committed and temporary state as `scope/<scope_id>/baseline` and `scope/<scope_id>/scan/<scan_id>`;
+- stored strict identity-bearing records keyed by recomputable `service_key`;
+- implemented successful-scan-gated same-scope opened, changed, closed, and reopened reconciliation;
+- implemented atomic whole-baseline promotion with closed tombstone retention;
+- implemented incomplete-scan cleanup with baseline preservation and joined diagnostics;
+- verified close/reopen durability and post-restart promotion.
+
+### Evidence
+
+Focused tests cover persistent compatibility, schema handling, scope and scan isolation, canonical record validation, TCP/UDP separation, lifecycle transitions, completion gating, atomic rollback, every incomplete completion status, cleanup failure, and database restart.
+
+B6.10 state-subsystem verification and gap-audit checks passed:
+
+```bash
+go test -count=1 ./internal/scanner
+go test -count=1 ./...
+go test -race -count=1 ./...
+go vet ./...
+git diff --check
+```
+
+The all-files `gofmt -d` audit also exposed one pre-existing extra blank line in committed `internal/scanner/dispatcher_test.go`; B6-changed Go files produced no formatting diff. A separate non-staging `git diff --no-index --check` audit covered every untracked B6 file and found no whitespace errors.
+
+### Remaining blocker
+
+The state subsystem is not active at runtime. The CLI still initializes `PortStates` and calls the legacy `StateManager`. There are no non-test callers of `InitializeStateSchema`, `SaveCurrentService`, or `FinalizeCurrentScan`.
+
+B6 therefore remains open. B6.10 is the state-subsystem verification and gap-audit checkpoint. B6.11 is runtime lifecycle-state integration; B6.12 is final cumulative verification and documentation closure.
+
+B6.11 must initialize schema v1 before legacy bucket creation, explicitly refuse legacy `PortStates` databases, generate and pair one canonical `scope_id` and unique `scan_id`, and call `EnsureCurrentScan` before scanning so an empty successful scan exists durably. Observation persistence must retain a sticky write failure while continuing to drain results. Results-channel closure establishes writer quiescence only. A completion passed as successful to `FinalizeCurrentScan` additionally requires successful scanner completion, successful current-scan creation, and successful persistence of every observation. Finalization occurs exactly once and returned changes remain internal until B7.
+
+-------------------------------------------------------------------------------------
+
+## 2026-08-28: B6.11.1-B6.11.5 — Runtime Lifecycle-State Primitives
+
+### Work completed
+
+- added one shared `internal/utils.ParseTargetLine` boundary for both scope capture and scanner replay;
+- added context-aware replay spooling for positional, file, stdin, and HTTP target streams, with immutable logical targets and joined cleanup diagnostics;
+- froze the B6-only output contract: legacy `port_state_delta` is retired, stdout is intentionally empty, and B7 lifecycle events remain forbidden;
+- added a pre-ownership startup boundary that prepares input, initializes or validates schema v1, refuses legacy/incompatible databases without mutation, and stops at readiness for reservation;
+- added atomic exclusive current-scan creation with a distinct same-scope collision sentinel while retaining opaque persistence scan IDs;
+- added CLI-local 128-bit random lowercase scan IDs, validation, four-attempt collision retry, and cancellation between attempts;
+- added `ownedRuntimeScan`, making replay cleanup explicit after successful reservation;
+- added an order-independent result/completion coordinator that offers every result to persistence, retains the first persistence failure, drains to writer quiescence, finalizes once, and closes ownership afterward.
+
+### Verified decisions
+
+- requested logical targets, not resolved result addresses, determine `scope_id`;
+- full-line comments and whitespace retain existing target-stream behavior, while inline `#` remains target data;
+- no scanner may start before exclusive durable scan reservation;
+- results-channel closure proves quiescence only and never proves scanner success;
+- persistence failures are sticky but do not stop later persistence attempts or channel drainage;
+- cleanup after successful finalization cannot retroactively change the authoritative completion or undo promotion;
+- orphan scan buckets remain isolated, unreused, and never automatically promoted. Cleanup remains the non-blocking **B6-M1 — Orphan Temporary-Scan Retention and Cleanup** maintenance backlog item outside the B6 completion gate.
+
+### Evidence
+
+- focused RED/GREEN tests for target preparation, schema refusal, output routing, exclusive reservation, collision/cancellation behavior, ownership, both channel orderings, complete drainage, sticky errors, exactly-once finalization, and cleanup;
+- affected `internal/utils`, `internal/scanner`, and `cmd/tcprecon` package suites passed at their respective checkpoints;
+- completion/result ordering passed 100 repeated runs;
+- all changed Go files were gofmt-clean and tracked/untracked whitespace checks passed.
+
+### Remaining work
+
+B6.11 is not complete. B6.11.6 must freeze missing-completion and full scanner/persistence/finalization precedence. The complete `ScanResult` observation adapter and actual `main` wiring remain outstanding. The executable therefore still creates legacy `PortStates` and calls `StateManager`; the new runtime primitives are verified but inactive. B6.12 remains responsible for repository-wide, race, vet, formatting, whitespace, and documentation closure after runtime activation.
+
+-------------------------------------------------------------------------------------
+
+## 2026-08-29: B6.11.6-B6.12 — Runtime Activation and B6 Closure
+
+### Work completed
+
+- made missing scanner completion fail closed as `worker_failed` with a dedicated discoverable sentinel;
+- froze scanner, persistence, finalization, and post-finalization cleanup precedence without allowing cleanup failure to retroactively invalidate a promoted baseline;
+- mapped every persistent observation field from `ScanResult` while excluding `TargetName` and transient state;
+- characterized orphan temporary scans across restart: IDs cannot be reused, orphans are never promoted automatically, and fresh finalization does not delete them;
+- added one top-level lifecycle runtime that prepares targets, derives canonical `scope_id`, validates schema v1, exclusively reserves a runtime `scan_id`, starts the scanner, persists observations, and finalizes exactly once after quiescence;
+- changed `main` to invoke that boundary directly and removed reachable CLI use of `PortStates` and `StateManager`;
+- froze the B6 output boundary: stdout is intentionally empty in both modes until B7; summaries and failures are emitted through `runtimeOutput` on stderr;
+- proved successful empty scans reconcile closures and incomplete or missing-completion scans preserve the committed baseline.
+
+### Runtime contract
+
+```text
+validate CLI and ports
+-> prepare one replayable logical-target stream
+-> derive scope_id
+-> open and validate schema v1
+-> exclusively reserve scan_id
+-> start scanner
+-> persist every observation under (scope_id, scan_id)
+-> wait for result-writer quiescence and explicit completion
+-> finalize exactly once
+-> close owned input and database
+```
+
+Result-channel closure remains quiescence evidence only. Successful baseline promotion still requires `ScanCompletion.Successful() == true` after scanner and temporary-persistence outcomes are composed.
+
+### Verification
+
+```bash
+go test -count=100 ./cmd/tcprecon -run '^(TestLifecycleRuntime|TestMainDelegatesToLifecycleRuntime)'
+go test -count=1 ./cmd/tcprecon
+go test -count=1 ./internal/scanner
+go test -count=1 ./...
+go test -race -count=1 ./...
+go vet ./...
+git diff --check
+```
+
+The package and repository tests that use `httptest` required loopback permission in the restricted execution environment and passed with that permission. All B6-changed Go files are gofmt-clean, and separate non-staging checks covered untracked files. The repository-wide formatting audit still reports the pre-existing extra blank line in `internal/scanner/dispatcher_test.go`; it was intentionally not mixed into B6.
+
+### Remaining limitations
+
+- B7 lifecycle-event serialization is not implemented; no `ServiceChange` leaves the runtime and stdout is intentionally empty.
+- **B6-M1 — Orphan Temporary-Scan Retention and Cleanup** remains a non-blocking maintenance item. Orphans are isolated and unpromotable but may consume disk space.
+- Legacy state-manager implementation remains in the scanner package as unreachable technical debt.
+
+### Outcome
+
+B6 is complete. Versioned lifecycle state, same-scope reconciliation, successful-scan-only atomic promotion, incomplete-scan preservation, restart behavior, and executable integration are implemented and cumulatively verified.

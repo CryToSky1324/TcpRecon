@@ -1,8 +1,8 @@
-# Phase B Progress: B1-B5
+# Phase B Progress: B1-B6
 
-**Updated:** 24 August 2026  
-**Branch:** `feat/service-lifecycle-reconciliation`  
-**Current status:** B1-B5 complete; B6 next
+**Updated:** 29 August 2026
+**Branch:** `feat/service-lifecycle-reconciliation`
+**Current status:** B1-B6 complete; lifecycle state is runtime-active; B7 event emission remains pending
 
 ## Phase B objective
 
@@ -306,3 +306,40 @@ B6 performs the commit.
 ```
 
 No `service.closed` event should be emitted merely because an observation is missing until B6 has proven same-scope successful-scan reconciliation.
+
+---
+
+## B6.1-B6.10 checkpoint — Versioned lifecycle state and gap audit
+
+**Status:** COMPLETE — STATE SUBSYSTEM AND CLI INTEGRATION VERIFIED
+
+Verified implementation now includes:
+
+- persistent `service_key` v1 compatibility;
+- schema-v1 metadata and explicit incompatibility refusal;
+- scope-partitioned committed baselines and scan-partitioned temporary observations;
+- strict identity-bearing service records;
+- successful-scan-gated same-scope reconciliation;
+- atomic baseline promotion and incomplete-scan discard;
+- database close/reopen durability;
+- repository-wide race, vet, and regression verification.
+
+The B6.10 audit originally found no runtime callers. B6.11 subsequently connected `InitializeStateSchema`, `SaveCurrentService`, and `FinalizeCurrentScan` through one top-level CLI lifecycle boundary and removed production CLI references to `PortStates` and `StateManager`.
+
+B6 must therefore retain the following completion gate before B7:
+
+```text
+runtime scan scope + scan_id
+    -> temporary schema-v1 observations
+    -> finalized matching ScanCompletion
+    -> exactly one FinalizeCurrentScan call after writers quiesce
+```
+
+This integration is now implemented and tested end to end through the runtime boundary.
+
+### Remaining named substages
+
+- **B6.11 — Runtime lifecycle-state integration:** complete. Shared preparation, empty pre-B7 stdout, schema enforcement, exclusive reservation, collision-safe IDs, observation mapping, order-independent coordination, sticky errors, exactly-once finalization, orphan isolation, and direct `main` delegation are verified.
+- **B6.12 — Final cumulative verification and documentation closure:** complete. Focused repetition, package/repository/race tests, vet, B6-touched-file formatting, tracked/untracked whitespace checks, and authoritative documentation reconciliation passed. The repository-wide audit still reports the documented pre-existing formatting defect in `internal/scanner/dispatcher_test.go`.
+
+The executable now uses schema-v1 lifecycle state. Successful empty scans can close missing baseline services, while every unsuccessful completion preserves the committed baseline. Stdout is intentionally empty until B7 owns lifecycle-event serialization; diagnostics remain on stderr. Legacy scanner state code remains present but is unreachable from the production CLI.

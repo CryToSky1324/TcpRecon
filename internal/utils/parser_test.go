@@ -102,6 +102,34 @@ func TestStreamTargetsSuccessfulProduction(t *testing.T) {
 	}
 }
 
+func TestStreamTargetsPreservesSharedTargetLineSemantics(t *testing.T) {
+	jobs := make(chan models.ScanJob, 2)
+	err := StreamTargets(
+		context.Background(),
+		strings.NewReader("  # ignored\n\n 127.0.0.1 \n"),
+		[]int{80},
+		[]int{53},
+		jobs,
+	)
+	close(jobs)
+	if err != nil {
+		t.Fatalf("StreamTargets() error = %v", err)
+	}
+
+	var got []models.ScanJob
+	for job := range jobs {
+		got = append(got, job)
+	}
+	if len(got) != 2 {
+		t.Fatalf("jobs = %v, want one TCP and one UDP job", got)
+	}
+	for _, job := range got {
+		if job.TargetIP != "127.0.0.1" || job.TargetName != "127.0.0.1" {
+			t.Fatalf("job target = (%q, %q), want trimmed 127.0.0.1", job.TargetIP, job.TargetName)
+		}
+	}
+}
+
 func TestStreamTargetsReportsParseFailure(t *testing.T) {
 	jobs := make(chan models.ScanJob, 2)
 

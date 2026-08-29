@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"flag"
 	"fmt"
@@ -15,7 +16,6 @@ import (
 
 	"github.com/CryToSky1324/TcpRecon/internal/scanner"
 	"github.com/CryToSky1324/TcpRecon/internal/utils"
-
 	"go.etcd.io/bbolt"
 )
 
@@ -55,18 +55,7 @@ func main() {
 		cancel()
 	}()
 
-	// 2. Dynamic Stream Routing (Supports Stdin, -iL flag, positional arg, and TARGET_URL env fallback)
-
-	stat, statErr := os.Stdin.Stat()
-	stdinPiped := statErr == nil && (stat.Mode()&os.ModeCharDevice) == 0
-	targetsReader, err := selectTargetReader(ctx, flag.Args(), *inputListPtr, os.Getenv("TARGET_URL"), os.Stdin, stdinPiped)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: %v\n", err)
-		os.Exit(1)
-	}
-	defer targetsReader.Close()
-
-	// 2. Parse Port Vectors
+	// 2. Parse Port Vectors before performing target-source I/O.
 	tcpPortsToScan, err := utils.ParsePortRange(*portsPtr)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] FATAL: Invalid TCP port specification: %v\n", err)
@@ -82,74 +71,34 @@ func main() {
 		}
 	}
 
-	if !*jsonPtr {
-		totalPorts := len(tcpPortsToScan) + len(udpPortsToScan)
-		fmt.Fprintf(os.Stderr, "[*] Initiating stream scan against %d ports (%d TCP, %d UDP) with %d Goroutines...\n", totalPorts, len(tcpPortsToScan), len(udpPortsToScan), *workersPtr)
-	}
-
-	// 4. State Store Initialization (bbolt)
 	dbPath := os.Getenv("DB_PATH")
 	if dbPath == "" {
 		dbPath = "./asm_state.db"
 	}
 
-	db, err := bbolt.Open(dbPath, 0600, &bbolt.Options{Timeout: 5 * time.Second})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: DB lock failed (K8s Concurrency Violation): %v\n", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-
-	err = db.Update(func(tx *bbolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists([]byte("PortStates"))
-		return err
+	stat, statErr := os.Stdin.Stat()
+	stdinPiped := statErr == nil && (stat.Mode()&os.ModeCharDevice) == 0
+	outcome := runLifecycleRuntime(ctx, lifecycleRuntimeConfig{
+		DBPath: dbPath, TCPPorts: tcpPortsToScan, UDPPorts: udpPortsToScan,
+		Workers: *workersPtr, Timeout: time.Duration(*timeoutPtr) * time.Millisecond,
+		RateLimit: *ratePtr, DebugMode: *debugPtr, JSONMode: *jsonPtr,
+		Stdout: os.Stdout, Stderr: os.Stderr,
+	}, lifecycleRuntimeDependencies{
+		PrepareTargets: func(ctx context.Context) (*preparedTargetSource, error) {
+			source, err := selectTargetReader(ctx, flag.Args(), *inputListPtr, os.Getenv("TARGET_URL"), os.Stdin, stdinPiped)
+			if err != nil {
+				return nil, err
+			}
+			return prepareTargetSource(ctx, source)
+		},
+		OpenState: func(path string) (*bbolt.DB, error) {
+			return bbolt.Open(path, 0600, &bbolt.Options{Timeout: 5 * time.Second})
+		},
+		GenerateScanID: func() (string, error) { return generateRuntimeScanID(rand.Reader) },
+		StartScanner:   scanner.Run,
 	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[!] FATAL: Bucket init failed: %v\n", err)
+	if outcome.Err != nil {
 		os.Exit(1)
-	}
-
-	// 5. Engine Invocation (Passing targetsReader correctly)
-	resultsChan, completionCh, startTime := scanner.Run(ctx, targetsReader, tcpPortsToScan, udpPortsToScan, *workersPtr, time.Duration(*timeoutPtr)*time.Millisecond, *ratePtr, *debugPtr, *jsonPtr)
-
-	// 6. State Manager Execution
-	openPorts, stateErr := scanner.StateManager(db, resultsChan, *jsonPtr)
-	completion, ok := <-completionCh
-	if !ok {
-		completion = scanner.ScanCompletion{}
-	}
-
-	finalCompletion := finalizeScanCompletion(
-		completion,
-		stateErr,
-	)
-
-	duration := time.Since(startTime)
-
-	if finalCompletion.Successful() {
-		if !*jsonPtr {
-			fmt.Fprintf(
-				os.Stderr,
-				"[*] Scan completed in %.2f seconds. Discovered %d open ports.\n",
-				duration.Seconds(),
-				openPorts,
-			)
-		}
-	} else {
-		if finalCompletion.Err != nil {
-			fmt.Fprintf(
-				os.Stderr,
-				"[!] Scan incomplete: status=%s error=%v\n",
-				finalCompletion.Status,
-				finalCompletion.Err,
-			)
-		} else {
-			fmt.Fprintf(
-				os.Stderr,
-				"[!] Scan incomplete: status=%s\n",
-				finalCompletion.Status,
-			)
-		}
 	}
 }
 

@@ -4,7 +4,7 @@
 
 ## 1. Purpose and scope
 
-TcpRecon is a Go-based authorised network-observation engine. It performs TCP full-connect reconnaissance and selected UDP probes, collects service metadata, and stores positive observations in bbolt. Repeated executions are intended to support attack-surface monitoring, but complete service lifecycle reconciliation is still under development.
+TcpRecon is a Go-based authorised network-observation engine. It performs TCP full-connect reconnaissance and selected UDP probes, collects service metadata, and reconciles successful scans into versioned bbolt lifecycle state. Lifecycle-event serialization remains under development.
 
 The project is not intended to outperform or replace mature scanners. Its engineering objective is to demonstrate a complete and reproducible pipeline:
 
@@ -12,15 +12,15 @@ The project is not intended to outperform or replace mature scanners. Its engine
 network observation → normalized state → lifecycle event → detection → analysis → remediation evidence
 ```
 
-The scanner, stable identity helpers, explicit scan-completion boundary, and observation-state foundations exist. Lifecycle reconciliation, stable baseline promotion, lifecycle events, Wazuh detection, and OpenSearch remediation analytics remain later parts of the vertical slice unless a section explicitly states otherwise.
+The scanner, stable identity helpers, explicit scan-completion boundary, and versioned lifecycle-state subsystem are runtime-active. The CLI now reconciles successful scans into scope-partitioned committed baselines while preserving baselines for incomplete scans. Lifecycle-event serialization, Wazuh detection, and OpenSearch remediation analytics remain later parts of the vertical slice unless a section explicitly states otherwise.
 
 ## 2. Design principles
 
 1. **Correctness before scale.** Input parsing, cancellation, state classification, and event semantics must be trustworthy before throughput is optimized.
 2. **Bounded concurrency.** Worker pools and bounded channels prevent unbounded goroutine and memory growth.
 3. **Controlled network impact.** A global rate limiter controls probe starts independently of concurrency.
-4. **Atomic telemetry.** Each NDJSON line contains one observation or lifecycle event.
-5. **Single ownership of persistent state.** A dedicated goroutine serializes bbolt writes.
+4. **Atomic telemetry.** Once B7 activates output, each NDJSON line will contain one lifecycle event.
+5. **Single ownership of persistent state.** Runtime coordination serializes observation persistence and finalization after scanner writers are quiescent.
 6. **No false remediation.** Partial or cancelled scans cannot replace a complete baseline.
 7. **Reproducible operations.** Wazuh rules, fixtures, mappings, dashboards, and deployment instructions belong in Git.
 8. **Honest claims.** Performance and reliability claims require tests and published evidence.
@@ -29,7 +29,7 @@ The scanner, stable identity helpers, explicit scan-completion boundary, and obs
 
 ### 3.1 Current scanner pipeline
 
-**Status: implemented, with lifecycle reconciliation still pending.**
+**Status: implemented with lifecycle reconciliation active; B7 event emission pending.**
 
 ```mermaid
 flowchart LR
@@ -44,8 +44,8 @@ flowchart LR
   UDPQ --> UDP[Selected UDP worker pool]
   TCP --> Results[Positive ScanResults]
   UDP --> Results
-  Results --> State[StateManager]
-  State <--> Bolt[(bbolt observation state)]
+  Results --> Current[Temporary observation persister]
+  Current <--> Bolt[(schema-v1 scoped state)]
 
   Producer -. producerErr .-> Completion[Scanner completion]
   Router -. routerErr .-> Completion
@@ -53,16 +53,18 @@ flowchart LR
   TCP -. workersDone .-> Completion
   UDP -. workersDone .-> Completion
 
-  State -. stateErr .-> Final[Final scan completion]
+  Current -. stateErr .-> Final[Final scan completion]
   Completion --> Final
-  Final --> CLI[CLI success / incomplete reporting]
+  Final --> Reconcile[FinalizeCurrentScan]
+  Reconcile --> Bolt
+  Reconcile --> CLI[stderr completion reporting]
 
   TCP -. diagnostics .-> Stderr[stderr]
   UDP -. diagnostics .-> Stderr
-  State -. diagnostics .-> Stderr
+  Current -. diagnostics .-> Stderr
 
-  ScopeDef[ScanScope.ID helper<br/>implemented and unit-tested] -. runtime baseline integration pending .-> Bolt
-  ServiceDef[ServiceIdentity.Key helper<br/>implemented and unit-tested] -. runtime baseline integration pending .-> Bolt
+  ScopeDef[ScanScope.ID] --> Bolt
+  ServiceDef[ServiceIdentity.Key v1] --> Bolt
 ```
 
 Verified Phase B completion behaviour:
@@ -72,16 +74,16 @@ Verified Phase B completion behaviour:
 - producer errors distinguish cancellation, target parse failure, and target-resolution failure;
 - router cancellation is propagated rather than discarded;
 - worker-level failure can make the scan incomplete when intended work cannot be executed;
-- `StateManager` returns persistence failure instead of only logging it;
-- the CLI combines scanner completion with the state-manager outcome before reporting success;
+- every observation is offered to temporary persistence and the first persistence failure remains sticky;
+- the CLI combines scanner completion with temporary-state persistence before finalization;
 - `ScanCompletion.Successful()` is true only for `completed` with no error.
 
 Current limitations relevant to Phase B:
 
 - workers still emit positive observations only;
-- the existing bbolt observation state is not yet the versioned committed-baseline model required for lifecycle reconciliation;
-- `scope_id` and `service_key` helpers remain isolated from durable baseline partitioning;
-- B5 provides the commit-authorization signal, but B6 must still implement temporary current-scan state, reconciliation, and atomic baseline promotion;
+- stdout is intentionally empty until B7 defines lifecycle-event serialization;
+- orphan temporary scans remain isolated and unpromotable but may consume storage until B6-M1 defines cleanup;
+- legacy `StateManager` code remains available in the scanner package but is unreachable from the production CLI;
 - UDP blocking reads remain deadline-bound and may not react immediately to cancellation.
 
 ### 3.2 Target lifecycle vertical slice
@@ -112,9 +114,10 @@ Phase B is being built incrementally so identity and lifecycle rules are verifie
 |---|---|---|
 | **B1: Trace current data flow** | Traced CLI input, target parsing/resolution, dispatch, TCP/UDP workers, results channel, state manager, bbolt updates, and current output. Confirmed that positive-only observations and channel closure are insufficient to prove a successful complete scan. | Complete analysis |
 | **B2: Define lifecycle and identity contracts** | Defined `service.opened`, `service.changed`, `service.closed`, `service.reopened`, temporary current-scan state, committed baseline semantics, and the successful-scan commit rule. The original `finding_id` proposal was later deferred during B4. | Complete on paper |
-| **B3: Stable scan-scope identity** | Implemented and unit-tested deterministic `ScanScope.ID()` from canonical targets plus separate TCP/UDP port sets. | Implemented and verified in isolation |
-| **B4: Stable service identity** | Implemented and unit-tested deterministic `ServiceIdentity.Key()` from `scope_id`, canonical IP, port, and protocol. | Implemented and verified in isolation |
+| **B3: Stable scan-scope identity** | Implemented and unit-tested deterministic `ScanScope.ID()` from canonical targets plus separate TCP/UDP port sets. | Runtime-active and verified |
+| **B4: Stable service identity** | Implemented and unit-tested deterministic `ServiceIdentity.Key()` from `scope_id`, canonical IP, port, and protocol. | Runtime-active and verified |
 | **B5: Explicit scan completion** | Implemented `ScanCompletion`, explicit failure statuses, producer/router/worker outcome propagation, sticky state-manager failure reporting, asynchronous completion from `Run`, and final CLI success gating. | Implemented and verified |
+| **B6: Versioned state and reconciliation** | Implemented schema-v1 metadata, scoped baseline/current storage, identity-bearing records, successful-scan-gated reconciliation, atomic promotion, incomplete-scan discard, restart/schema verification, and complete CLI lifecycle orchestration. | Complete, runtime-active, and verified |
 
 The active Phase B identity chain is now:
 
@@ -124,7 +127,9 @@ scope_id -> service_key -> event_id
 
 `finding_id` is deliberately deferred. It will be introduced only if one service can own multiple independent security findings rather than one lifecycle history.
 
-B5 now provides the trustworthy scan-level success/failure boundary required before absence can be used as lifecycle evidence. Neither B3 nor B4 is yet connected to runtime reconciliation or bbolt baseline promotion. B6 is the next safety boundary: versioned state, temporary current-scan observations, same-scope reconciliation, and atomic baseline promotion gated by B5.
+B5 provides the trustworthy scan-level success/failure boundary required before absence can be used as lifecycle evidence. B6 now implements and tests the state-side safety boundary, including successful-completion gating. B6.10 is the state-subsystem verification and gap-audit checkpoint. B6.11 owns runtime lifecycle-state integration, and B6.12 owns final cumulative verification and documentation closure.
+
+B6.11.1-B6.11.9 provide shared target tokenization, replay spooling, an explicit pre-B7 output boundary, pre-ownership schema enforcement, collision-safe scan reservation, complete observation mapping, order-independent result/completion coordination, orphan isolation, and executable integration. `main` directly calls this boundary.
 
 ## 4. Major components
 
@@ -223,7 +228,7 @@ Unstable fields must not influence observation fingerprints:
 
 ### 4.7 Stable scan-scope identity
 
-**Status: implemented and unit-tested in isolation; runtime integration pending.**
+**Status: implemented, runtime-active, and verified.**
 
 `internal/scanner/scope.go` defines `ScanScope` and derives a deterministic ID from a versioned canonical representation containing:
 
@@ -264,11 +269,11 @@ Verified tests cover:
 - hostname, CIDR, IPv6, and whitespace normalization;
 - absence of caller-slice mutation.
 
-Current limitation: the CLI does not yet preserve and pass a canonical `ScanScope` into scanner execution or bbolt state. The helper therefore cannot yet prevent cross-scope reconciliation mistakes at runtime.
+The CLI derives this identity from the prepared logical targets and configured TCP/UDP ports before reserving temporary scan state. Reconciliation and promotion remain confined to that scope.
 
 ### 4.8 Stable service identity
 
-**Status: implemented and unit-tested in isolation; runtime and persistence integration pending.**
+**Status: implemented, runtime-active, and persistently verified.**
 
 `internal/scanner/service_identity.go` defines `ServiceIdentity` with exactly four identity inputs:
 
@@ -312,9 +317,9 @@ Verified tests cover:
 - invalid port rejection and valid boundary acceptance;
 - empty scope-ID rejection.
 
-A fixed known-vector compatibility test is intentionally deferred until `service_key` becomes persisted state. At that boundary, the exact v1 derivation must be frozen or migrated explicitly so a serialization refactor cannot manufacture false `closed` and `opened` transitions.
+The persistent `service_key` v1 derivation is frozen by a fixed known-vector compatibility test. Any future representation change requires an explicit compatibility or migration boundary so a serialization refactor cannot manufacture false `closed` and `opened` transitions.
 
-Current limitation: `ServiceIdentity.Key()` is not yet attached to `ScanResult`, the temporary current-scan observation set, reconciliation, or bbolt keys.
+The runtime observation adapter constructs `ServiceIdentity` from each `ScanResult` plus the owned scope, and persistence recomputes and validates the key when records are loaded.
 
 ### 4.9 Explicit scan completion
 
@@ -361,7 +366,7 @@ producer outcome
 
 `scanner.Run` returns both the observation stream and an asynchronous completion channel. The completion path does not block normal result consumption.
 
-The CLI then combines scanner completion with `StateManager` persistence outcome:
+The CLI combines scanner completion with temporary-observation persistence outcome:
 
 ```text
 scanner completion + stateErr = final scan completion
@@ -381,28 +386,29 @@ B5 verification includes focused tests, 100 repeated completion/worker test runs
 
 B5 provides the authorization signal for baseline promotion. It does not itself implement lifecycle baseline replacement. B6 must require `ScanCompletion.Successful() == true` before a temporary current-scan observation set can become the committed baseline.
 
-### 4.10 State manager and bbolt
+### 4.10 Lifecycle state and bbolt
 
-**Current status: positive-observation hashing exists; persistence failure is now explicit; complete lifecycle storage is planned for B6.**
+**Current status: the versioned lifecycle store is active in the CLI.**
 
-Workers do not write directly to bbolt. They send scan results to `StateManager`, which serializes persistence work.
+Workers do not write directly to bbolt. Runtime orchestration consumes results and writes them to the owned temporary scan partition.
 
 B5 changed the state-manager boundary from an open-port count only to an explicit persistence outcome:
 
 ```text
-StateManager(...) -> (openPorts, stateErr)
+runtime observation persistence -> sticky stateErr
 ```
 
 Persistence-error behaviour is deliberately sticky:
 
-1. the first bbolt update failure is retained;
-2. subsequent state writes are skipped for that run;
-3. `StateManager` continues draining the results channel;
-4. when the result stream closes, it returns the accumulated open-port count and retained error.
+1. every observation receives a persistence attempt;
+2. the first persistence failure remains authoritative;
+3. later persistence failures do not replace it;
+4. result drainage continues until writers are quiescent;
+5. finalization receives `state_failed` and cannot promote the temporary scan.
 
 Continuing to drain results after persistence failure is a concurrency-safety requirement. Returning immediately could leave scanner workers blocked while sending into `results`, preventing their `WaitGroup` from completing and preventing scan completion from resolving.
 
-The existing bbolt layout is still observation-oriented and is not yet the durable lifecycle schema. B6 requires explicit metadata and scoped state such as:
+Schema v1 uses this lifecycle layout:
 
 ```text
 metadata/schema_version
@@ -411,11 +417,11 @@ scope/<scope_id>/baseline/<service_key>/...
 scope/<scope_id>/scan/<scan_id>/<service_key>/...
 ```
 
-Baseline and temporary current-scan records will be keyed by stable `service_key` within `scope_id`. TCP and UDP observations for the same numbered port are separate services.
+Baseline and temporary current-scan records are keyed by stable `service_key` within `scope_id`. TCP and UDP observations for the same numbered port are separate services. Unknown, incomplete, malformed, and legacy schemas are explicitly rejected before scanner startup.
 
 ## 5. Lifecycle reconciliation
 
-**Status: contract defined; implementation pending.**
+**Status: implemented, runtime-active, and verified.**
 
 Hash suppression alone detects first-seen or changed positive observations, but cannot reliably detect service closure. Complete lifecycle tracking compares a successfully finished scan with the previous committed baseline for the same scope.
 
@@ -443,17 +449,23 @@ A scan can be successful only when:
 - the process was not cancelled;
 - state persistence completed without error.
 
-B5 does not yet perform the durable baseline commit. B6 owns the temporary current-scan set, same-scope reconciliation, and atomic replacement of the committed baseline.
+B6's `FinalizeCurrentScan` owns the state transition: successful scans atomically reconcile and replace the committed baseline, while incomplete scans produce no changes and attempt targeted temporary-state discard. The CLI calls this boundary exactly once after result writers are quiescent.
+
+At runtime, results-channel closure may establish only that observation writers are quiescent. It does not establish scan success. The completion passed to `FinalizeCurrentScan` may be successful only when scanner completion is successful, the current-scan bucket was created successfully, every temporary observation write succeeded, and all writers have stopped. The current-scan bucket must be created even when the successful scan observes zero services.
 
 Temporary observations from incomplete scans must be discarded rather than promoted. This prevents outages, parser/resolution failures, worker failures, persistence failures, or Ctrl+C from being reported as successful remediation.
+
+B6.11 initializes schema v1 before scan ownership and explicitly refuses legacy `PortStates` databases. Returned `ServiceChange` values remain internal until B7; runtime integration emits no lifecycle events prematurely.
+
+The B6.11 output boundary deliberately retires the legacy `port_state_delta` format without replacement: stdout is intentionally empty in both JSON and non-JSON modes until B7. Start, completion, failure, cancellation, and debug diagnostics remain on stderr.
 
 ### 5.2 Stable identifiers
 
 | Identifier | Contract | Current status |
 |---|---|---|
-| `scan_id` | Unique to one execution | Planned |
-| `scope_id` | Stable hash of canonical targets plus separate TCP and UDP port sets | Helper implemented and tested; runtime integration pending |
-| `service_key` | Stable identity of one service within a scope: canonical IP + port + protocol under `scope_id` | Helper implemented and tested; runtime integration pending |
+| `scan_id` | Unique to one execution | Runtime-generated 128-bit lowercase hexadecimal ID with exclusive reservation |
+| `scope_id` | Stable hash of canonical targets plus separate TCP and UDP port sets | Runtime-active baseline partition |
+| `service_key` | Stable identity of one service within a scope: canonical IP + port + protocol under `scope_id` | Runtime-active persistent v1 key |
 | `event_id` | Unique identity of one lifecycle event | Planned |
 | `finding_id` | Separate security-finding identity | Deferred until one service can own multiple independent findings |
 
@@ -461,7 +473,7 @@ The active Phase B identity chain is `scope_id -> service_key -> event_id`. Work
 
 ## 6. Event pipeline
 
-**Current status:** TcpRecon can emit machine-readable observation or delta records while diagnostics belong on stderr.
+**Current status:** Lifecycle changes remain internal, stdout is intentionally empty, and diagnostics belong on stderr.
 
 **Target status:** TcpRecon emits one versioned NDJSON object per lifecycle or operational event.
 
@@ -619,14 +631,9 @@ git diff --check
 
 These checks verify deterministic scope identity, deterministic service identity, IP canonicalization, TCP/UDP separation, validation behavior, and absence of scope-input mutation. They do not prove runtime integration, persistent compatibility, successful scan completion, or lifecycle reconciliation.
 
-### 12.2 Planned unit tests
+### 12.2 B6 state verification
 
-- fixed known-vector compatibility for `service_key` when persistence begins;
-- bbolt schema versioning;
-- scan completion and cancellation state;
-- lifecycle-set reconciliation;
-- event serialization;
-- restart persistence.
+Verified coverage includes the fixed persistent `service_key` v1 vector, schema metadata and incompatibility handling, scope/scan partitioning, strict persistent records, lifecycle reconciliation, successful atomic promotion, incomplete-scan discard, TCP/UDP separation, and close/reopen durability. Event serialization remains B7 work.
 
 ### 12.3 Local integration tests
 
@@ -662,6 +669,6 @@ Until the vertical slice is complete, the project will not prioritize:
 
 ## 14. Historical evolution
 
-The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based observation suppression, and added container and Kubernetes deployment baselines. Phase B has since traced the lifecycle failure paths, defined the lifecycle contract, and implemented stable `scope_id` and `service_key` primitives in isolation.
+The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based observation suppression, and added container and Kubernetes deployment baselines. Phase B has since traced lifecycle failure paths and activated stable scope/service identity, versioned state, safe reconciliation, and successful-scan-only baseline promotion in the CLI.
 
 Wazuh detection, OpenSearch analytics, complete lifecycle reconciliation, and remediation tracking remain target work until they have reproducible implementation evidence.

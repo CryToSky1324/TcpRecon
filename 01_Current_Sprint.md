@@ -1,9 +1,9 @@
 # 01_Current_Sprint: Phase B Service Lifecycle Foundation
 
-**Updated:** 24 August 2026
+**Updated:** 29 August 2026
 **Status:** ACTIVE
 **Active branch:** `feat/service-lifecycle-reconciliation`
-**Current workstream:** B6 — Versioned state and reconciliation
+**Current workstream:** B7 — lifecycle event emission (B6 complete)
 
 ## Sprint goal
 
@@ -126,9 +126,7 @@ go test -race -count=1 ./internal/scanner
 go vet ./internal/scanner
 ```
 
-Remaining limitation:
-
-`ScanScope.ID()` is still an isolated identity primitive. Runtime orchestration and bbolt baseline partitioning do not yet use it.
+Runtime note: `ScanScope.ID()` now partitions the lifecycle baseline using the prepared logical targets and separate TCP/UDP port sets.
 
 ### B4: Stable service identity
 
@@ -189,9 +187,7 @@ Design decisions closed during B4:
 - protocol normalization is not performed inside the identity layer; upstream code must provide canonical `tcp`/`udp` values and the identity layer validates them;
 - a fixed known-vector compatibility test is deferred until `service_key` becomes persistent bbolt state.
 
-Remaining limitation:
-
-`ServiceIdentity.Key()` is still isolated. It is not yet attached to runtime scan results, temporary current-scan observations, reconciliation, or bbolt keys.
+Runtime note: `ServiceIdentity.Key()` is now the durable record key used by temporary observations, reconciliation, and committed baselines.
 
 ### B5: Explicit scan completion
 
@@ -284,17 +280,62 @@ B5 determines whether a scan is eligible to advance durable lifecycle state. B6 
 
 ### B6: Versioned state and reconciliation
 
-**Status:** NEXT / ACTIVE WORKSTREAM
+**Status:** COMPLETE — IMPLEMENTED, RUNTIME-ACTIVE, AND VERIFIED
 
-- [ ] add versioned bbolt metadata;
-- [ ] freeze the persistent `service_key` v1 representation with a known-vector compatibility test before using it as durable state;
-- [ ] isolate baselines by `scope_id`;
-- [ ] key service records by `service_key`;
-- [ ] keep temporary current observations separate from committed state;
-- [ ] compute opened, changed, closed, and reopened transitions;
-- [ ] commit only after B5 reports a complete successful scan;
-- [ ] preserve state across database restart;
-- [ ] define migration or explicit incompatibility behaviour.
+- [x] add versioned bbolt metadata;
+- [x] freeze the persistent `service_key` v1 representation with a known-vector compatibility test before using it as durable state;
+- [x] isolate baselines by `scope_id`;
+- [x] key service records by `service_key`;
+- [x] keep temporary current observations separate from committed state;
+- [x] compute opened, changed, closed, and reopened transitions;
+- [x] commit only after B5 reports a complete successful scan;
+- [x] discard incomplete-scan temporary state without changing the baseline;
+- [x] preserve state across database restart;
+- [x] explicitly reject unknown, incomplete, malformed, and legacy schemas;
+- [x] pass focused, repository-wide, race-enabled, vet, B6-touched-file formatting, and whitespace verification;
+- [x] replace the CLI's legacy `PortStates` path with runtime calls to `InitializeStateSchema`, `SaveCurrentService`, and `FinalizeCurrentScan`;
+- [x] generate one `scan_id`, derive one canonical `scope_id`, and pair both with the matching finalized `ScanCompletion` after writers are quiesced.
+
+#### B6.10 — State-subsystem verification and gap audit
+
+**Status:** COMPLETE CHECKPOINT; NOT FINAL B6 VERIFICATION
+
+The package-level state subsystem passed focused, repository, race, vet, formatting, and tracked/untracked whitespace checks. The audit identified the missing runtime caller and therefore did not close B6.
+
+#### B6.11 — Runtime lifecycle-state integration
+
+**Status:** COMPLETE — B6.11.1-B6.11.9 IMPLEMENTED AND VERIFIED
+
+- [x] share one target-line tokenizer between scope capture and scanner replay;
+- [x] spool one-shot target sources with deterministic cleanup and cancellation checks;
+- [x] define the temporary B6 output contract: empty stdout, no legacy delta or B7 event serialization;
+- [x] initialize/refuse schema v1 before reservation and clean prepared input on rejection;
+- [x] generate collision-resistant runtime scan IDs and exclusively create an existing-empty current scan;
+- [x] keep persistence scan IDs opaque outside the runtime generator/reservation boundary;
+- [x] establish ownership only after durable exclusive reservation;
+- [x] coordinate results and scanner completion without arrival-order assumptions;
+- [x] attempt persistence for every observation, retain the first failure, and fully drain results;
+- [x] finalize exactly once after result-writer quiescence and clean owned replay input afterward;
+- [x] freeze missing-completion plus scanner/persistence/finalization error precedence in B6.11.6;
+- [x] map every `ScanResult` comparison field into `SaveCurrentService` through the real runtime adapter;
+- [x] characterize orphan isolation and non-promotion across restart without adding cleanup policy;
+- [x] wire target preparation, canonical `scope_id`, reservation, scanner execution, persistence, and finalization into `main`;
+- [x] prove actual CLI ordering opens bbolt only after target preparation and refuses legacy state before scanning.
+
+#### B6.12 — Final cumulative verification and documentation closure
+
+**Status:** COMPLETE
+
+- [x] rerun focused integration tests repeatedly;
+- [x] rerun package, repository, race, vet, B6-touched-file formatting, and tracked/untracked whitespace checks;
+- [x] document the actual runtime path, schema refusal behavior, empty-scan handling, and remaining limitations;
+- [x] close B6 after runtime activation and cumulative verification passed.
+
+All B6-touched Go files are gofmt-clean. The repository-wide audit still reports one pre-existing formatting defect in `internal/scanner/dispatcher_test.go`; it is outside the B6 change set and does not block closure.
+
+Maintenance backlog outside the B6 completion gate:
+
+- **B6-M1 — Orphan Temporary-Scan Retention and Cleanup:** define a future retention policy for isolated, unpromotable orphan scan buckets. B6.11 performs no startup sweep, TTL deletion, migration, or repair.
 
 ### B7: Lifecycle event emission
 
@@ -328,7 +369,7 @@ Phase B is complete only when all of the following are demonstrated:
 
 ## Current documentation evidence
 
-B1-B5 are now documented as completed work with their limitations preserved. B6 is the next active workstream.
+B1-B6 are implemented and verified. `main` now delegates to the lifecycle runtime, which prepares replayable targets, derives `scope_id`, enforces schema v1, reserves a unique `scan_id`, persists temporary observations, and finalizes exactly once after quiescence. Legacy `StateManager` and `PortStates` code remains in the scanner package but is unreachable from the production CLI.
 
 Current documentation responsibilities:
 
@@ -342,10 +383,6 @@ README, changelog, event-schema, Wazuh, and dashboard documentation should not c
 
 ## Immediate next actions
 
-1. Begin B6 by defining versioned bbolt metadata and the scope-partitioned baseline layout.
-2. Freeze the persistent `service_key` v1 representation with a known-vector compatibility test before durable use.
-3. Introduce temporary current-scan observations separately from the committed baseline.
-4. Gate any baseline promotion on `ScanCompletion.Successful() == true`.
-5. Add reconciliation tests for opened, changed, closed, and reopened transitions before lifecycle-event emission.
-6. Preserve the B5 invariant that cancelled, failed, partial, or unresolved scans cannot replace the committed baseline.
-7. Re-run focused tests, full tests, race tests, `go vet`, and `git diff --check` before closing B6.
+1. Begin B7 with the versioned lifecycle-event schema and stable `event_id` contract.
+2. Keep B6 reconciliation results internal until B7 serialization is verified.
+3. Retain **B6-M1** as non-blocking maintenance work for orphan temporary-scan retention and cleanup.

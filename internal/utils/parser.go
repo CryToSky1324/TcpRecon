@@ -47,8 +47,8 @@ func StreamTargets(ctx context.Context, r io.Reader, tcpPorts []int, udpPorts []
 	scanner := bufio.NewScanner(r)
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		line, keep := ParseTargetLine(scanner.Text())
+		if !keep {
 			continue
 		}
 		// CIDR target
