@@ -72,10 +72,18 @@ func TestFingerprintOS(t *testing.T) {
 
 func TestStreamTargetsIPv4AndIPv6(t *testing.T) {
 	jobs := make(chan models.ScanJob, 2)
-	go func() {
-		defer close(jobs)
-		StreamTargets(context.Background(), strings.NewReader("127.0.0.1\n::1\n"), []int{80}, nil, jobs)
-	}()
+
+	err := StreamTargets(
+		context.Background(),
+		strings.NewReader("127.0.0.1\n::1\n"),
+		[]int{80},
+		nil,
+		jobs,
+	)
+	close(jobs)
+	if err != nil {
+		t.Fatalf("StreamTargets() error = %v", err)
+	}
 
 	var got []string
 	for job := range jobs {

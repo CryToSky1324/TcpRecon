@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -126,22 +125,4 @@ func reservePreparedRuntimeScanWith(
 	}
 	ready(owned)
 	return owned, nil
-}
-
-func reservePreparedRuntimeScan(
-	ctx context.Context,
-	db *bbolt.DB,
-	scopeID string,
-	prepared *preparedTargetSource,
-	ready func(*ownedRuntimeScan),
-) (*ownedRuntimeScan, error) {
-	return reservePreparedRuntimeScanWith(
-		ctx,
-		db,
-		scopeID,
-		prepared,
-		func() (string, error) { return generateRuntimeScanID(rand.Reader) },
-		scanner.CreateCurrentScanExclusive,
-		ready,
-	)
 }
