@@ -21,3 +21,38 @@ type ScanJob struct {
 	Port       int
 	Protocol   string
 }
+
+type ScannerMeta struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
+type AssetIdentity struct {
+	IP       string `json:"ip"`
+	Hostname string `json:"hostname"`
+}
+
+type NetworkObservation struct {
+	Protocol string `json:"protocol"`
+	Port     int    `json:"port"`
+	State    string `json:"state"`
+}
+
+type StateChange struct {
+	Type          string `json:"type"`
+	PreviousState string `json:"previous_state"`
+}
+
+type LifecycleEvent struct {
+	SchemaVersion string `json:"schema_version"`
+	EventID       string `json:"event_id"`
+	ScanID        string `json:"scan_id"`
+	ScopeID       string `json:"scope_id"`
+	Timestamp     string `json:"timestamp"`
+	EventType     string `json:"event_type"`
+
+	Scanner ScannerMeta        `json:"scanner"`
+	Asset   AssetIdentity      `json:"asset"`
+	Network NetworkObservation `json:"network"`
+	Change  StateChange        `json:"change"`
+}

@@ -390,7 +390,6 @@ func TestStartScannerCompletionReportsSuccess(t *testing.T) {
 	}
 }
 
-
 func TestStartScannerCompletionWaitsForPipeline(t *testing.T) {
 	ctx := context.Background()
 

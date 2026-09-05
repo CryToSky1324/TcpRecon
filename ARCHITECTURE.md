@@ -473,24 +473,23 @@ The active Phase B identity chain is `scope_id -> service_key -> event_id`. Work
 
 ## 6. Event pipeline
 
-**Current status:** Lifecycle changes remain internal, stdout is intentionally empty, and diagnostics belong on stderr.
+**Status: implemented and verified.**
 
-**Target status:** TcpRecon emits one versioned NDJSON object per lifecycle or operational event.
+TcpRecon emits one versioned NDJSON object per lifecycle event adhering strictly to `docs/EVENT_SCHEMA.md`:
 
 ```text
-stdout → telemetry only
+stdout → telemetry only (pure NDJSON)
 stderr → diagnostics only
 ```
 
-The planned lifecycle vocabulary is:
+Canonical lifecycle vocabulary:
 
-- `service.opened`
-- `service.changed`
-- `service.closed`
-- `service.reopened`
-- optional operational events such as `scan.failed`
+- `service.opened`: new service observed with no active baseline record in the scope;
+- `service.changed`: open service mutates Layer 7 banner or TLS metadata;
+- `service.reopened`: previously closed service observed open again;
+- `service.closed`: previously open service absent or closed following a successful scan.
 
-The canonical lifecycle schema will be documented in `docs/EVENT_SCHEMA.md` when its fields and semantics are implemented and verified.
+The event envelope forbids nested arrays to maintain compatibility with Wazuh's `analysisd` decoder.
 
 ## 7. Wazuh integration
 
