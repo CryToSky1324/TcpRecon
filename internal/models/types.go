@@ -2,16 +2,31 @@ package models
 
 // ScanResult structures our output for the main thread and JSON encoding
 type ScanResult struct {
-	TargetName  string   `json:"target"`
-	TargetIP    string   `json:"ip"`
-	Port        int      `json:"port"`
-	Protocol    string   `json:"protocol"`
-	State       string   `json:"state"`
-	Banner      string   `json:"banner,omitempty"`
-	OSHint      string   `json:"os_hint,omitempty"`
-	CertSubject string   `json:"tls_subject,omitempty"`
-	CertIssuer  string   `json:"tls_issuer,omitempty"`
-	SANs        []string `json:"tls_sans,omitempty"`
+	TargetName    string   `json:"target"`
+	TargetIP      string   `json:"ip"`
+	Port          int      `json:"port"`
+	Protocol      string   `json:"protocol"`
+	State         string   `json:"state"`
+	Banner        string   `json:"banner,omitempty"`
+	OSHint        string   `json:"os_hint,omitempty"`
+	CertSubject   string   `json:"tls_subject,omitempty"`
+	CertIssuer    string   `json:"tls_issuer,omitempty"`
+	SANs          []string `json:"tls_sans,omitempty"`
+	TLSVersion    string   `json:"tls_version,omitempty"`
+	CipherSuite   string   `json:"cipher_suite,omitempty"`
+	CertVerified  bool     `json:"cert_verified"`
+	CertNotBefore string   `json:"cert_not_before,omitempty"`
+	CertNotAfter  string   `json:"cert_not_after,omitempty"`
+}
+
+// tlsMetadata encapsulates Layer 6/7 cryptographic telemetry
+// extracted during the non-fatal TLS probe.
+type tlsMetaData struct {
+	Version      string
+	CipherSuite  string
+	NotBefore    string
+	NotAfter     string
+	CertVerified bool
 }
 
 // ScanJob defines a single atomic scanning task across the dispatcher
