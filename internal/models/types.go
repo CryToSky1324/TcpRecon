@@ -43,8 +43,11 @@ type ScannerMeta struct {
 }
 
 type AssetIdentity struct {
-	IP       string `json:"ip"`
-	Hostname string `json:"hostname"`
+	IP          string `json:"ip"`
+	Hostname    string `json:"hostname"`
+	Environment string `json:"environment"` // e.g., "production", "staging", "development", "unassigned"
+	Criticality string `json:"criticality"` // e.g., "tier-0", "tier-1", "tier-2", "low", "unassigned"
+	Owner       string `json:"owner"`       // e.g., "secops", "platform-infra", "unassigned"
 }
 
 type NetworkObservation struct {

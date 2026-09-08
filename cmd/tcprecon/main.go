@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/CryToSky1324/TcpRecon/internal/enrichment"
 	"github.com/CryToSky1324/TcpRecon/internal/scanner"
 	"github.com/CryToSky1324/TcpRecon/internal/utils"
 	"go.etcd.io/bbolt"
@@ -28,6 +29,7 @@ func main() {
 	inputListPtr := flag.String("iL", "", "Input file containing list of targets/CIDRs")
 	debugPtr := flag.Bool("d", false, "Enable debug mode")
 	jsonPtr := flag.Bool("j", false, "Output results strictly in JSON format")
+	assetRulesPtr := flag.String("asset-rules", "", "Path to static asset inventory JSON file")
 
 	flag.Parse()
 
@@ -78,11 +80,30 @@ func main() {
 
 	stat, statErr := os.Stdin.Stat()
 	stdinPiped := statErr == nil && (stat.Mode()&os.ModeCharDevice) == 0
+
+	var assetRules []enrichment.AssetRule
+	if *assetRulesPtr != "" {
+		var err error
+		assetRules, err = enrichment.LoadRulesFromFile(*assetRulesPtr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[!] FATAL: Failed to load asset rules: %v\n", err)
+			os.Exit(1)
+		}
+	}
+	matcher := enrichment.NewMatcher(assetRules)
+
 	outcome := runLifecycleRuntime(ctx, lifecycleRuntimeConfig{
-		DBPath: dbPath, TCPPorts: tcpPortsToScan, UDPPorts: udpPortsToScan,
-		Workers: *workersPtr, Timeout: time.Duration(*timeoutPtr) * time.Millisecond,
-		RateLimit: *ratePtr, DebugMode: *debugPtr, JSONMode: *jsonPtr,
-		Stdout: os.Stdout, Stderr: os.Stderr,
+		DBPath:    dbPath,
+		TCPPorts:  tcpPortsToScan,
+		UDPPorts:  udpPortsToScan,
+		Workers:   *workersPtr,
+		Timeout:   time.Duration(*timeoutPtr) * time.Millisecond,
+		RateLimit: *ratePtr,
+		DebugMode: *debugPtr,
+		JSONMode:  *jsonPtr,
+		Stdout:    os.Stdout,
+		Stderr:    os.Stderr,
+		Matcher:   matcher,
 	}, lifecycleRuntimeDependencies{
 		PrepareTargets: func(ctx context.Context) (*preparedTargetSource, error) {
 			source, err := selectTargetReader(ctx, flag.Args(), *inputListPtr, os.Getenv("TARGET_URL"), os.Stdin, stdinPiped)

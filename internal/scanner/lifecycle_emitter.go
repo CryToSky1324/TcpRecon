@@ -1,13 +1,64 @@
 package scanner
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
+	"github.com/CryToSky1324/TcpRecon/internal/enrichment"
 	"github.com/CryToSky1324/TcpRecon/internal/models"
 	"github.com/cespare/xxhash/v2"
 )
+
+// serviceRecordToScanResult maps an internal bbolt ServiceRecord into a models.ScanResult.
+func serviceRecordToScanResult(r *ServiceRecord) *models.ScanResult {
+	if r == nil {
+		return nil
+	}
+	return &models.ScanResult{
+		TargetIP:    r.IP,
+		Port:        r.Port,
+		Protocol:    r.Protocol,
+		State:       string(r.Status),
+		Banner:      r.Banner,
+		OSHint:      r.OSHint,
+		CertSubject: r.CertSubject,
+		CertIssuer:  r.CertIssuer,
+		SANs:        r.SANs,
+	}
+}
+
+// EmitLifecycleChanges maps committed ServiceChange deltas into enriched LifecycleEvents
+// and writes them as newline-delimited JSON (NDJSON) to w.
+func EmitLifecycleChanges(
+	w io.Writer,
+	scopeID string,
+	scanID string,
+	changes []ServiceChange,
+	matcher enrichment.Matcher,
+) error {
+	enc := json.NewEncoder(w)
+	for _, change := range changes {
+		prior := serviceRecordToScanResult(change.Previous)
+		curr := serviceRecordToScanResult(change.Current)
+
+		// Authoritative scan completion is guaranteed true here because
+		// FinalizeCurrentScan only returns changes on successful promotion.
+		event, err := mapDeltaToLifecycleEvent(scopeID, scanID, prior, curr, true, matcher)
+		if err != nil {
+			return err
+		}
+		if event == nil {
+			continue
+		}
+		if err := enc.Encode(event); err != nil {
+			return fmt.Errorf("failed to encode lifecycle event NDJSON: %w", err)
+		}
+	}
+	return nil
+}
 
 func hashScanResult(r *models.ScanResult) uint64 {
 	if r == nil {
@@ -29,6 +80,7 @@ func mapDeltaToLifecycleEvent(
 	prior *models.ScanResult,
 	curr *models.ScanResult,
 	scanSuccessful bool,
+	matcher enrichment.Matcher,
 ) (*models.LifecycleEvent, error) {
 
 	// Incomplete scans must NEVER emit closures or advance state
@@ -36,6 +88,32 @@ func mapDeltaToLifecycleEvent(
 		if curr == nil || (curr != nil && curr.State == "closed") {
 			return nil, nil
 		}
+	}
+
+	var targetIP, hostname string
+	if curr != nil {
+		targetIP = curr.TargetIP
+		hostname = curr.TargetName
+	} else if prior != nil {
+		// service.closed fallback: curr is nil, extract identity from baseline
+		targetIP = prior.TargetIP
+		hostname = prior.TargetName
+	}
+
+	env, crit, owner := "unassigned", "unassigned", "unassigned"
+	if matcher != nil && targetIP != "" {
+		ctx := matcher.MatchString(targetIP)
+		env = ctx.Environment
+		crit = ctx.Criticality
+		owner = ctx.Owner
+	}
+
+	asset := models.AssetIdentity{
+		IP:          targetIP,
+		Hostname:    hostname,
+		Environment: env,
+		Criticality: crit,
+		Owner:       owner,
 	}
 
 	// B7-01, B7-07, B7-08: New Discovery
@@ -57,10 +135,7 @@ func mapDeltaToLifecycleEvent(
 				Name:    "tcprecon",
 				Version: "1.0.0",
 			},
-			Asset: models.AssetIdentity{
-				IP:       curr.TargetIP,
-				Hostname: curr.TargetName,
-			},
+			Asset: asset,
 			Network: models.NetworkObservation{
 				Protocol: curr.Protocol,
 				Port:     curr.Port,
@@ -88,10 +163,7 @@ func mapDeltaToLifecycleEvent(
 					Name:    "tcprecon",
 					Version: "1.0.0",
 				},
-				Asset: models.AssetIdentity{
-					IP:       curr.TargetIP,
-					Hostname: curr.TargetName,
-				},
+				Asset: asset,
 				Network: models.NetworkObservation{
 					Protocol: curr.Protocol,
 					Port:     curr.Port,
@@ -121,10 +193,7 @@ func mapDeltaToLifecycleEvent(
 				Name:    "tcprecon",
 				Version: "1.0.0",
 			},
-			Asset: models.AssetIdentity{
-				IP:       curr.TargetIP,
-				Hostname: curr.TargetName,
-			},
+			Asset: asset,
 			Network: models.NetworkObservation{
 				Protocol: curr.Protocol,
 				Port:     curr.Port,
@@ -140,21 +209,17 @@ func mapDeltaToLifecycleEvent(
 	//B7-04: Closed Service
 	if scanSuccessful && prior != nil && prior.State == "open" && (curr == nil || curr.State == "closed") {
 		// Identity resolution: Fallback to prior if curr was dropped / unobserved
-		ip := prior.TargetIP
-		hostname := prior.TargetName
 		proto := prior.Protocol
 		port := prior.Port
 
 		if curr != nil {
-			ip = curr.TargetIP
-			hostname = curr.TargetName
 			proto = curr.Protocol
 			port = curr.Port
 		}
 
 		return &models.LifecycleEvent{
 			SchemaVersion: "1.0",
-			EventID:       fmt.Sprintf("%s-%s-%s-%d", scanID, ip, proto, port),
+			EventID:       fmt.Sprintf("%s-%s-%s-%d", scanID, targetIP, proto, port),
 			ScanID:        scanID,
 			ScopeID:       scopeID,
 			Timestamp:     time.Now().UTC().Format(time.RFC3339),
@@ -164,10 +229,7 @@ func mapDeltaToLifecycleEvent(
 				Name:    "tcprecon",
 				Version: "1.0.0",
 			},
-			Asset: models.AssetIdentity{
-				IP:       ip,
-				Hostname: hostname,
-			},
+			Asset: asset,
 			Network: models.NetworkObservation{
 				Protocol: proto,
 				Port:     port,

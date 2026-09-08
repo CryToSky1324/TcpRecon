@@ -3,15 +3,26 @@ package main
 import (
 	"bytes"
 	"errors"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/CryToSky1324/TcpRecon/internal/models"
+	"github.com/CryToSky1324/TcpRecon/internal/enrichment"
 	"github.com/CryToSky1324/TcpRecon/internal/scanner"
 )
 
-func TestRuntimeOutputKeepsStdoutEmptyUntilB7(t *testing.T) {
+func TestRuntimeOutputEmitsLifecycleEventsNDJSON(t *testing.T) {
+	rules := []enrichment.AssetRule{
+		{
+			Prefix:      netip.MustParsePrefix("192.0.2.0/24"),
+			Environment: "production",
+			Criticality: "tier-1",
+			Owner:       "sre-team",
+		},
+	}
+	matcher := enrichment.NewMatcher(rules)
+
 	for _, jsonMode := range []bool{false, true} {
 		name := "non-json"
 		if jsonMode {
@@ -22,45 +33,45 @@ func TestRuntimeOutputKeepsStdoutEmptyUntilB7(t *testing.T) {
 			var stderr bytes.Buffer
 			output := newRuntimeOutput(&stdout, &stderr, jsonMode)
 
-			output.Observation(models.ScanResult{
-				TargetName:  "example.test",
-				TargetIP:    "192.0.2.10",
-				Port:        443,
-				Protocol:    "tcp",
-				State:       "OPEN",
-				Banner:      "test banner",
-				OSHint:      "test os",
-				CertSubject: "subject",
-				CertIssuer:  "issuer",
-				SANs:        []string{"example.test"},
-			})
-			output.LifecycleChanges([]scanner.ServiceChange{{
-				Kind:       scanner.ChangeOpened,
-				ServiceKey: strings.Repeat("a", 64),
-			}})
+			changes := []scanner.ServiceChange{
+				{
+					Kind:       scanner.ChangeOpened,
+					ServiceKey: "key-1",
+					Current: &scanner.ServiceRecord{
+						IP:       "192.0.2.10",
+						Port:     443,
+						Protocol: "tcp",
+						Status:   scanner.ServiceStatusOpen,
+						Banner:   "nginx/1.24",
+					},
+				},
+			}
 
-			if stdout.Len() != 0 {
-				t.Fatalf("stdout = %q, want empty B6 output", stdout.String())
+			err := output.LifecycleChanges("scope-test", "scan-100", changes, matcher)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
 			}
-			for _, forbidden := range []string{
-				"port_state_delta",
-				`"ip":"192.0.2.10"`,
-				"service.opened",
-				"service.changed",
-				"service.closed",
-				"service.reopened",
-			} {
-				if strings.Contains(stdout.String(), forbidden) {
-					t.Fatalf("stdout contains forbidden pre-B7 record %q: %q", forbidden, stdout.String())
-				}
+
+			rawOutput := stdout.String()
+			if !strings.Contains(rawOutput, `"event_type":"service.opened"`) {
+				t.Fatalf("stdout missing event_type: %q", rawOutput)
 			}
-			if stderr.Len() != 0 {
-				t.Fatalf("observation/change stderr = %q, want empty", stderr.String())
+			if !strings.Contains(rawOutput, `"environment":"production"`) {
+				t.Fatalf("stdout missing enriched environment: %q", rawOutput)
+			}
+			if !strings.Contains(rawOutput, `"criticality":"tier-1"`) {
+				t.Fatalf("stdout missing enriched criticality: %q", rawOutput)
+			}
+			if !strings.Contains(rawOutput, `"owner":"sre-team"`) {
+				t.Fatalf("stdout missing enriched owner: %q", rawOutput)
+			}
+
+			if strings.Contains(rawOutput, "port_state_delta") {
+				t.Fatalf("stdout contains retired port_state_delta: %q", rawOutput)
 			}
 		})
 	}
 }
-
 func TestRuntimeOutputPreservesNonJSONSummariesOnStderr(t *testing.T) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

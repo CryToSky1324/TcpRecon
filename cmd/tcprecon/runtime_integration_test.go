@@ -377,21 +377,24 @@ func TestLifecycleRuntimeOutputBoundary(t *testing.T) {
 			var stderr bytes.Buffer
 			prepared, _, _ := integrationPrepared("192.0.2.10")
 			outcome := runLifecycleRuntime(context.Background(), integrationConfig(filepath.Join(t.TempDir(), "state.db"), &stdout, &stderr, jsonMode), lifecycleRuntimeDependencies{
-				PrepareTargets: func(context.Context) (*preparedTargetSource, error) { return prepared, nil }, OpenState: integrationDBOpener(nil),
+				PrepareTargets: func(context.Context) (*preparedTargetSource, error) { return prepared, nil },
+				OpenState:      integrationDBOpener(nil),
 				GenerateScanID: func() (string, error) { return integrationScanID, nil },
 				StartScanner:   integrationScanner([]models.ScanResult{{TargetIP: "192.0.2.10", Port: 443, Protocol: "tcp", State: "OPEN"}}, &scanner.ScanCompletion{Status: scanner.ScanStatusCompleted}, nil),
 			})
 			if outcome.Err != nil {
 				t.Fatal(outcome.Err)
 			}
-			if stdout.Len() != 0 {
-				t.Fatalf("stdout = %q, want empty", stdout.String())
+
+			// In both modes, stdout is the dedicated NDJSON stream
+			if !strings.Contains(stdout.String(), `"event_type":"service.opened"`) {
+				t.Fatalf("stdout = %q, want emitted service.opened event", stdout.String())
 			}
-			for _, forbidden := range []string{"port_state_delta", `"ip"`, "service.opened", "service.changed", "service.closed", "service.reopened"} {
-				if strings.Contains(stdout.String(), forbidden) {
-					t.Fatalf("stdout contains forbidden %q", forbidden)
-				}
+			if strings.Contains(stdout.String(), "port_state_delta") {
+				t.Fatalf("stdout contains forbidden legacy record: %q", stdout.String())
 			}
+
+			// Stderr stream discipline: JSON mode suppresses summaries, non-JSON preserves them
 			if jsonMode && stderr.Len() != 0 {
 				t.Fatalf("JSON success stderr = %q, want empty", stderr.String())
 			}

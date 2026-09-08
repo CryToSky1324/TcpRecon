@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/CryToSky1324/TcpRecon/internal/enrichment"
 	"github.com/CryToSky1324/TcpRecon/internal/models"
 	"github.com/CryToSky1324/TcpRecon/internal/scanner"
 	"go.etcd.io/bbolt"
@@ -22,6 +23,7 @@ type lifecycleRuntimeConfig struct {
 	JSONMode  bool
 	Stdout    io.Writer
 	Stderr    io.Writer
+	Matcher   enrichment.Matcher
 }
 
 type runtimeStateOpener func(string) (*bbolt.DB, error)
@@ -122,8 +124,12 @@ func runLifecycleRuntime(
 			return scanner.FinalizeCurrentScan(db, scopeID, scanID, completion)
 		},
 	)
+
 	outcome.Execution = execution
-	output.LifecycleChanges(execution.Changes)
+	if emitErr := output.LifecycleChanges(scopeID, outcome.ScanID, execution.Changes, config.Matcher); emitErr != nil {
+		output.RuntimeFailure(emitErr)
+		outcome.Err = errors.Join(outcome.Err, emitErr)
+	}
 	output.ScanFinished(time.Since(startedAt), execution.OpenPorts, execution.Completion)
 	closeErr := db.Close()
 	outcome.Err = errors.Join(execution.Err, closeErr)

@@ -1,8 +1,11 @@
 package scanner
 
 import (
+	"encoding/json"
+	"net/netip"
 	"testing"
 
+	"github.com/CryToSky1324/TcpRecon/internal/enrichment"
 	"github.com/CryToSky1324/TcpRecon/internal/models"
 )
 
@@ -36,6 +39,7 @@ func TestLifecycleEvents(t *testing.T) {
 				tc.priorState,
 				tc.currentObs,
 				tc.scanSuccessful,
+				nil,
 			)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -259,4 +263,105 @@ func getLifecycleTestCases() []lifecycleTestCase {
 			wantCurrState:  "open",
 		},
 	}
+}
+
+func TestLifecycleEvents_EnrichedAssetContext(t *testing.T) {
+	rules := []enrichment.AssetRule{
+		{
+			Prefix:      netip.MustParsePrefix("10.10.5.0/24"),
+			Environment: "production",
+			Criticality: "tier-0",
+			Owner:       "secops",
+		},
+	}
+	matcher := enrichment.NewMatcher(rules)
+
+	t.Run("Enriches matched IP with configured context", func(t *testing.T) {
+		curr := &models.ScanResult{
+			TargetIP:   "10.10.5.15",
+			TargetName: "vault.internal",
+			Port:       443,
+			Protocol:   "tcp",
+			State:      "open",
+		}
+
+		event, err := mapDeltaToLifecycleEvent("scope-c2", "scan-1", nil, curr, true, matcher)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if event == nil {
+			t.Fatal("expected emitted event, got nil")
+		}
+
+		if event.Asset.Environment != "production" {
+			t.Errorf("Environment = %q, want %q", event.Asset.Environment, "production")
+		}
+		if event.Asset.Criticality != "tier-0" {
+			t.Errorf("Criticality = %q, want %q", event.Asset.Criticality, "tier-0")
+		}
+		if event.Asset.Owner != "secops" {
+			t.Errorf("Owner = %q, want %q", event.Asset.Owner, "secops")
+		}
+
+		rawJSON, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("json.Marshal failed: %v", err)
+		}
+		assertNoNestedArrays(t, rawJSON)
+	})
+
+	t.Run("Unmatched IP defaults safely to unassigned context", func(t *testing.T) {
+		curr := &models.ScanResult{
+			TargetIP:   "192.168.1.50",
+			TargetName: "dev-box.local",
+			Port:       8080,
+			Protocol:   "tcp",
+			State:      "open",
+		}
+
+		event, err := mapDeltaToLifecycleEvent("scope-c2", "scan-2", nil, curr, true, matcher)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if event == nil {
+			t.Fatal("expected emitted event, got nil")
+		}
+
+		if event.Asset.Environment != "unassigned" ||
+			event.Asset.Criticality != "unassigned" ||
+			event.Asset.Owner != "unassigned" {
+			t.Errorf("expected all fields 'unassigned', got %+v", event.Asset)
+		}
+
+		rawJSON, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("json.Marshal failed: %v", err)
+		}
+		assertNoNestedArrays(t, rawJSON)
+	})
+}
+
+// assertNoNestedArrays recursively traverses unmarshaled JSON to guarantee zero []any slices exist.
+// This enforces the invariant protecting wazuh-analysisd from decoding truncation.
+func assertNoNestedArrays(t *testing.T, rawJSON []byte) {
+	t.Helper()
+
+	var root any
+	if err := json.Unmarshal(rawJSON, &root); err != nil {
+		t.Fatalf("assertNoNestedArrays: failed to unmarshal event JSON: %v", err)
+	}
+
+	var walk func(node any, path string)
+	walk = func(node any, path string) {
+		switch val := node.(type) {
+		case []any:
+			t.Fatalf("wazuh-analysisd invariant violation: nested JSON array detected at %q", path)
+		case map[string]any:
+			for k, v := range val {
+				walk(v, path+"."+k)
+			}
+		}
+	}
+
+	walk(root, "$")
 }
