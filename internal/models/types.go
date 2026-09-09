@@ -19,16 +19,6 @@ type ScanResult struct {
 	CertNotAfter  string   `json:"cert_not_after,omitempty"`
 }
 
-// tlsMetadata encapsulates Layer 6/7 cryptographic telemetry
-// extracted during the non-fatal TLS probe.
-type tlsMetaData struct {
-	Version      string
-	CipherSuite  string
-	NotBefore    string
-	NotAfter     string
-	CertVerified bool
-}
-
 // ScanJob defines a single atomic scanning task across the dispatcher
 type ScanJob struct {
 	TargetIP   string
@@ -73,7 +63,7 @@ type LifecycleEvent struct {
 	Asset   AssetIdentity      `json:"asset"`
 	Network NetworkObservation `json:"network"`
 	Change  StateChange        `json:"change"`
-	Risk		RiskMeta					 `json:"risk"`
+	Risk    RiskMeta           `json:"risk"`
 }
 
 type RiskMeta struct {
