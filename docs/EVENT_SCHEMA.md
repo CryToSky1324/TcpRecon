@@ -13,58 +13,40 @@ This document defines the target versioned NDJSON contract. Fields marked as req
 
 ## Example
 
-```json
 {
-  "schema_version": "1.0.0",
-  "event": {
-    "id": "019ad1be-example",
-    "type": "service.opened",
-    "created": "2026-07-29T07:00:00Z"
-  },
-  "observer": {
+  "schema_version": "1.0",
+  "event_id": "019ad1be-example",
+  "scan_id": "scan-example",
+  "scope_id": "scope-example",
+  "timestamp": "2026-07-29T07:00:00Z",
+  "event_type": "service.opened",
+  "scanner": {
     "name": "tcprecon",
-    "version": "0.2.0"
-  },
-  "scan": {
-    "id": "scan-example",
-    "scope_id": "scope-example",
-    "complete": true
+    "version": "1.0.0"
   },
   "asset": {
-    "name": "lab-web",
-    "ip": "172.20.0.10"
+    "ip": "172.20.0.10",
+    "hostname": "lab-web.local",
+    "environment": "production",
+    "criticality": "tier-0",
+    "owner": "secops"
   },
-  "service": {
-    "finding_id": "finding-example",
+  "network": {
     "protocol": "tcp",
     "port": 443,
-    "state": "open",
-    "name": "https",
-    "banner": "HTTP/1.1 200 OK",
-    "tls": {
-      "version": "TLS1.3",
-      "cipher_suite": "TLS_AES_128_GCM_SHA256",
-      "subject": "lab-web.local",
-      "issuer": "Lab CA",
-      "sans": ["lab-web.local"]
-    }
+    "state": "open"
   },
-  "lifecycle": {
-    "previous_state": "unknown",
-    "current_state": "open",
-    "first_seen": "2026-07-29T07:00:00Z",
-    "last_seen": "2026-07-29T07:00:00Z",
-    "resolved_at": null
+  "change": {
+    "type": "new_service",
+    "previous_state": "closed"
   },
   "risk": {
-    "policy_version": "unassigned",
-    "score": 0,
-    "severity": "informational",
-    "reasons": []
-  },
-  "error": null
+    "policy_version": "1.0",
+    "score": 50,
+    "severity": "medium",
+    "reasons": "deprecated_tls,critical_asset_tier0"
+  }
 }
-```
 
 ## Event types
 
@@ -74,19 +56,16 @@ This document defines the target versioned NDJSON contract. Fields marked as req
 | `service.changed` | Service exists in both baselines but its stable normalized observation changed. |
 | `service.closed` | Service existed previously but is absent from a successfully completed current scan. |
 | `service.reopened` | A previously resolved finding is observed again. |
-| `scan.failed` | Optional operational event for a scan that could not safely commit a baseline. |
 
 ## Required invariants
 
 - `schema_version` is present on every event.
-- `event.id` is unique.
-- `scan.id` identifies one execution.
-- `scan.scope_id` is stable for the same normalized targets, ports, and protocols.
-- `service.finding_id` is stable across opened, changed, closed, and reopened events.
-- `service.protocol`, `asset.ip`, and `service.port` jointly identify the network service.
+- `event_id` is unique.
+- `scan_id` identifies one execution.
+- `scope_id` is stable for the same normalized targets, ports, and protocols.
+- `network.protocol`, `asset.ip`, and `network.port` jointly identify the network service.
 - `service.closed` is emitted only after a complete scan.
-- `error` is JSON `null` when no error exists.
-- Newlines and control characters inside banners remain escaped within one JSON line.
+- **Zero-Nested-Arrays Invariant:** The event envelope stringently forbids nested arrays/slices to maintain compatibility with Wazuh's `analysisd` JSON decoder[cite: 22]. Context lists (e.g., `risk.reasons`) must be formatted as comma-delimited scalar strings.
 
 ## Compatibility rules
 
@@ -95,7 +74,3 @@ This document defines the target versioned NDJSON contract. Fields marked as req
 - Changing a field type requires a schema-version change.
 - Reusing an event type with different semantics is prohibited.
 - Internal Go struct names do not define the external contract.
-
-## Hash normalization
-
-The comparison hash may include stable service fields but must exclude timestamps, latency, event identifiers, temporary errors, and execution settings. Hash format changes require state-schema migration or explicit database reset.

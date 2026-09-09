@@ -2,16 +2,21 @@ package models
 
 // ScanResult structures our output for the main thread and JSON encoding
 type ScanResult struct {
-	TargetName  string   `json:"target"`
-	TargetIP    string   `json:"ip"`
-	Port        int      `json:"port"`
-	Protocol    string   `json:"protocol"`
-	State       string   `json:"state"`
-	Banner      string   `json:"banner,omitempty"`
-	OSHint      string   `json:"os_hint,omitempty"`
-	CertSubject string   `json:"tls_subject,omitempty"`
-	CertIssuer  string   `json:"tls_issuer,omitempty"`
-	SANs        []string `json:"tls_sans,omitempty"`
+	TargetName    string   `json:"target"`
+	TargetIP      string   `json:"ip"`
+	Port          int      `json:"port"`
+	Protocol      string   `json:"protocol"`
+	State         string   `json:"state"`
+	Banner        string   `json:"banner,omitempty"`
+	OSHint        string   `json:"os_hint,omitempty"`
+	CertSubject   string   `json:"tls_subject,omitempty"`
+	CertIssuer    string   `json:"tls_issuer,omitempty"`
+	SANs          []string `json:"tls_sans,omitempty"`
+	TLSVersion    string   `json:"tls_version,omitempty"`
+	CipherSuite   string   `json:"cipher_suite,omitempty"`
+	CertVerified  bool     `json:"cert_verified"`
+	CertNotBefore string   `json:"cert_not_before,omitempty"`
+	CertNotAfter  string   `json:"cert_not_after,omitempty"`
 }
 
 // ScanJob defines a single atomic scanning task across the dispatcher
@@ -28,8 +33,11 @@ type ScannerMeta struct {
 }
 
 type AssetIdentity struct {
-	IP       string `json:"ip"`
-	Hostname string `json:"hostname"`
+	IP          string `json:"ip"`
+	Hostname    string `json:"hostname"`
+	Environment string `json:"environment"` // e.g., "production", "staging", "development", "unassigned"
+	Criticality string `json:"criticality"` // e.g., "tier-0", "tier-1", "tier-2", "low", "unassigned"
+	Owner       string `json:"owner"`       // e.g., "secops", "platform-infra", "unassigned"
 }
 
 type NetworkObservation struct {
@@ -55,4 +63,12 @@ type LifecycleEvent struct {
 	Asset   AssetIdentity      `json:"asset"`
 	Network NetworkObservation `json:"network"`
 	Change  StateChange        `json:"change"`
+	Risk    RiskMeta           `json:"risk"`
+}
+
+type RiskMeta struct {
+	PolicyVersion string `json:"policy_version"`
+	Score         int    `json:"score"`
+	Severity      string `json:"severity"`
+	Reasons       string `json:"reasons"` // Delimited scalar string to prevent array flattening failures
 }

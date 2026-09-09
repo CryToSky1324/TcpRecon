@@ -419,6 +419,19 @@ scope/<scope_id>/scan/<scan_id>/<service_key>/...
 
 Baseline and temporary current-scan records are keyed by stable `service_key` within `scope_id`. TCP and UDP observations for the same numbered port are separate services. Unknown, incomplete, malformed, and legacy schemas are explicitly rejected before scanner startup.
 
+### 4.11 Asset Enrichment & Context Mapping
+**Status: implemented and verified.**
+The `internal/enrichment` package utilizes a Longest Prefix Match (LPM) CIDR routing table to apply local asset context (Environment, Criticality, Owner) to discovered endpoints. Unmatched addresses fail securely to `"unassigned"`. 
+
+### 4.12 Deterministic Risk Scoring
+**Status: implemented and verified.**
+The `internal/risk` package computes explainable scores natively without relying on SIEM rule matrices. Risk Policy v1.0 implements:
+- Integer bounding (0 to 100 max points).
+- Mathematical integration of exposure severity (e.g., cleartext, exposed datastores), cryptographic posture (deprecated TLS, invalid certs), and asset criticality (`tier-0` multiplier).
+- Remediation Gating: `service.closed` events forcibly evaluate to score `0` and `severity: "informational"`.
+- Zero-Nested-Arrays Serialization: Multi-factor findings are encoded strictly as scalar, comma-delimited strings (`"reasons": "deprecated_tls,exposed_datastore"`).
+
+
 ## 5. Lifecycle reconciliation
 
 **Status: implemented, runtime-active, and verified.**
@@ -477,27 +490,23 @@ The active Phase B identity chain is `scope_id -> service_key -> event_id`. Work
 
 TcpRecon emits one versioned NDJSON object per lifecycle event adhering strictly to `docs/EVENT_SCHEMA.md`:
 
-```text
 stdout → telemetry only (pure NDJSON)
 stderr → diagnostics only
-```
 
 Canonical lifecycle vocabulary:
-
-- `service.opened`: new service observed with no active baseline record in the scope;
-- `service.changed`: open service mutates Layer 7 banner or TLS metadata;
-- `service.reopened`: previously closed service observed open again;
+- `service.opened`: new service observed with no active baseline record in the scope.
+- `service.changed`: open service mutates Layer 7 banner or TLS metadata.
+- `service.reopened`: previously closed service observed open again.
 - `service.closed`: previously open service absent or closed following a successful scan.
 
-The event envelope forbids nested arrays to maintain compatibility with Wazuh's `analysisd` decoder.
+The event envelope rigidly forbids nested arrays (e.g., mapping `SANs` or `Reasons` directly to `[]string`) to maintain explicit parsing compatibility with Wazuh's `analysisd` decoder[cite: 22].
 
 ## 7. Wazuh integration
 
 **Status: planned and dependent on verified lifecycle events.**
 
-Wazuh will read the event file using a JSON `<localfile>` configuration. Repository-owned integration assets should be arranged as:
+Wazuh will read the event file using a JSON `<localfile>` configuration[cite: 22]. Repository-owned integration assets should be arranged as[cite: 22]:
 
-```text
 deployments/wazuh/
 ├── README.md
 ├── config/
@@ -512,7 +521,7 @@ deployments/wazuh/
 └── scripts/
     ├── install-rules.sh
     └── uninstall-rules.sh
-```
+    ```
 
 Rule design should separate:
 

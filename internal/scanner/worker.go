@@ -103,22 +103,29 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 			}
 		}
 
+		meta := probeTLS(conn, job.TargetName, timeout)
+
 		// 7. Stateless OS Fingerprinting Execution
 		osHint := utils.FingerprintOS(banner)
 
 		// 8. Graceful Teardown and Channel Push
 		activeConn.Close()
 		results <- models.ScanResult{
-			TargetName:  job.TargetName,
-			TargetIP:    job.TargetIP,
-			Port:        job.Port,
-			Protocol:    "tcp",
-			State:       "OPEN",
-			Banner:      strings.TrimSpace(banner),
-			OSHint:      osHint,
-			CertSubject: certSubject,
-			CertIssuer:  certIssuer,
-			SANs:        sans,
+			TargetName:    job.TargetName,
+			TargetIP:      job.TargetIP,
+			Port:          job.Port,
+			Protocol:      "tcp",
+			State:         "open",
+			Banner:        strings.TrimSpace(banner),
+			OSHint:        osHint,
+			CertSubject:   certSubject,
+			CertIssuer:    certIssuer,
+			SANs:          sans,
+			TLSVersion:    meta.Version,
+			CipherSuite:   meta.CipherSuite,
+			CertVerified:  meta.CertVerified,
+			CertNotBefore: meta.NotBefore,
+			CertNotAfter:  meta.NotAfter,
 		}
 	}
 }

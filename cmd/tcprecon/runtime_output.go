@@ -5,6 +5,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/CryToSky1324/TcpRecon/internal/enrichment"
 	"github.com/CryToSky1324/TcpRecon/internal/models"
 	"github.com/CryToSky1324/TcpRecon/internal/scanner"
 )
@@ -29,7 +30,14 @@ func (o *runtimeOutput) Observation(models.ScanResult) {}
 
 // LifecycleChanges intentionally keeps B6 reconciliation results internal.
 // B7 owns lifecycle-event serialization.
-func (o *runtimeOutput) LifecycleChanges([]scanner.ServiceChange) {}
+func (o *runtimeOutput) LifecycleChanges(
+	scopeID string,
+	scanID string,
+	changes []scanner.ServiceChange,
+	matcher enrichment.Matcher,
+) error {
+	return scanner.EmitLifecycleChanges(o.stdout, scopeID, scanID, changes, matcher)
+}
 
 func (o *runtimeOutput) RuntimeFailure(err error) {
 	if err != nil {
