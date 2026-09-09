@@ -73,4 +73,12 @@ type LifecycleEvent struct {
 	Asset   AssetIdentity      `json:"asset"`
 	Network NetworkObservation `json:"network"`
 	Change  StateChange        `json:"change"`
+	Risk		RiskMeta					 `json:"risk"`
+}
+
+type RiskMeta struct {
+	PolicyVersion string `json:"policy_version"`
+	Score         int    `json:"score"`
+	Severity      string `json:"severity"`
+	Reasons       string `json:"reasons"` // Delimited scalar string to prevent array flattening failures
 }

@@ -757,3 +757,216 @@ The package and repository tests that use `httptest` required loopback permissio
 ### Outcome
 
 B6 is complete. Versioned lifecycle state, same-scope reconciliation, successful-scan-only atomic promotion, incomplete-scan preservation, restart behavior, and executable integration are implemented and cumulatively verified.
+
+------------------------------------------------------------------------
+
+## 2026-09-05: B7 — Canonical Lifecycle Event Emission
+
+### Goal
+
+Implement and verify the Phase B7 lifecycle event emitter to transform state reconciliation deltas into schema-compliant NDJSON security events adhering to `docs/EVENT_SCHEMA.md`.
+
+### Starting state
+
+B6 completed versioned state storage, scope-bounded baseline reconciliation, and atomic baseline promotion in bbolt[cite: 3]. However, the runtime stdout stream remained intentionally empty[cite: 3]. The scanner could determine state deltas internally, but could not yet emit versioned `service.opened`, `service.changed`, `service.closed`, and `service.reopened` NDJSON telemetry[cite: 3].
+
+### Work completed
+
+- Implemented `mapDeltaToLifecycleEvent` in `internal/scanner/lifecycle_emitter.go`:
+  - `service.opened`: emitted when a port is newly observed without an active baseline record in the current scope.
+  - `service.changed`: emitted when an open port mutates its Layer 7 metadata (banner, TLS certificates).
+  - `service.reopened`: emitted when a previously closed service is observed open again.
+  - `service.closed`: emitted when a previously open service is missing or marked closed following an authoritative scan.
+- Implemented deterministic Layer 7 mutation hashing (`hashScanResult`) using `github.com/cespare/xxhash/v2` matching the state engine's hashing model.
+- Aligned `models.LifecycleEvent` and sub-models in `internal/models/types.go` to match the canonical schema (`SchemaVersion`, `EventID`, `AssetIdentity`, `NetworkObservation`, `StateChange`, `ScannerMeta`).
+- Created table-driven test suite `TestLifecycleEvents` in `internal/scanner/lifecycle_event_test.go` covering 8 distinct lifecycle scenarios:
+  - `TC-B7-01`: Brand new service emits `service.opened`.
+  - `TC-B7-02`: Modified banner on open port emits `service.changed`.
+  - `TC-B7-03`: Reopened service emits `service.reopened`.
+  - `TC-B7-04`: Closed service emits `service.closed`.
+  - `TC-B7-05`: Identical service suppresses emission.
+  - `TC-B7-06`: Incomplete scan suppresses `service.closed`.
+  - `TC-B7-07`: Multi-tenant scope isolation (Scope A active port emits `service.opened` in Scope B).
+  - `TC-B7-08`: Protocol isolation (TCP open port does not match UDP observation on same port, emitting `service.opened`).
+
+### Problems encountered
+
+#### Nil-pointer dereference in closure branch
+
+In initial drafts of B7-04 (`service.closed`), `curr` is `nil` because the target was not observed. Referencing `curr.TargetIP`, `curr.Protocol`, or `curr.Port` when constructing `EventID` or `AssetIdentity` triggered runtime nil-pointer panics.
+
+Fixed by establishing an identity fallback: when `curr == nil`, all network and asset identity fields fall back to reading from `prior`.
+
+#### Variable shadowing in fallback resolution
+
+An early implementation of the fallback assignment used short variable declarations (`:=`) inside `if curr != nil`, shadowing the outer `ip`, `hostname`, `proto`, and `port` variables and reverting values to `prior` once the block closed. Corrected by using simple assignment (`=`).
+
+#### Multi-tenant scope boundary test failure (`TC-B7-07`)
+
+`TC-B7-07` failed initially because the test fixture injected Scope A's `priorState` into Scope B's mapper execution. In reality, bbolt buckets are strictly partitioned by `scope_id`, so a scan in Scope B returns `nil` for prior records by definition. Corrected the test fixture to pass `priorState: nil` for Scope B.
+
+#### Layer 4 protocol collision (`TC-B7-08`)
+
+`TC-B7-08` failed because an observation on UDP/53 was compared against a TCP/53 baseline, saw matching open states, and was suppressed as identical. Fixed by adding a protocol parity check (`prior.Protocol != curr.Protocol`) to force classification as a new service when L4 protocols differ.
+
+### Decisions I made
+
+- Evaluated mutations via deterministic `xxhash.Sum64String` over normalized observation fields (`State|Banner|CertSubject|CertIssuer|SANs`) rather than chaining struct field equality checks.
+- Enforced strict authoritative scan gating: `service.closed` can never be synthesized if `scanSuccessful == false`.
+- Prohibited nested slices/arrays in the emitted `LifecycleEvent` envelope to prevent Wazuh `analysisd` decoding truncation bugs.
+- Kept the event mapper scoped to single-scope evaluation; multi-tenant isolation is enforced at the database bucket layer, not through cross-scope mapper branching.
+
+### Evidence
+
+Files touched:
+- `internal/models/types.go`
+- `internal/scanner/lifecycle_emitter.go`
+- `internal/scanner/lifecycle_event_test.go`
+
+Verification commands:
+
+```bash
+go test -v ./internal/scanner -run TestLifecycleEvents
+go test -race -v ./internal/scanner/...
+```
+
+Observed result:
+- all 8 lifecycle subtests in `TestLifecycleEvents` passed cleanly;
+- all 37 package-level unit and integration tests passed;
+- race detector confirmed zero race conditions across concurrency pipelines (`ok github.com/CryToSky1324/TcpRecon/internal/scanner 1.164s`).
+
+### Remaining limitations
+
+- Telemetry output wiring into the runtime executable (`cmd/tcprecon`) and live pipeline validation against Wazuh remain to be integrated in Phase 0 / Phase D.
+- Orphan temporary scan cleanup (**B6-M1**) remains an open non-blocking maintenance item.
+
+### What I learned
+
+State reconciliation and event mapping operate on different boundaries: the database handles partition isolation by `scope_id`, while the mapper handles transition logic for a single scope. Attempting to make the mapper aware of cross-scope comparisons violates layer separation and produces misleading test fixtures.
+
+Defensive fallback handling is required for negative observations: when an entity disappears (`curr == nil`), the baseline record is the sole source of identity truth.
+
+
+-------------------------------------------------------------------------------------
+
+## 2026-09-09: C.1 — Non-Fatal TLS Inspection and Cryptographic Telemetry
+
+### Goal
+
+Capture Layer 6/7 cryptographic telemetry (negotiated TLS version, cipher suite, validity boundaries, and verification status) during active port scanning without masking Layer 4 socket availability or dropping open port states on cryptographic failures[cite: 4, 7].
+
+### Starting state
+
+Phase B established robust Layer 4 lifecycle reconciliation and state persistence backed by bbolt[cite: 1, 2]. However, the probe engine operated exclusively at the transport socket level[cite: 4]. The scanner had no mechanism to inspect TLS configurations, evaluate certificate expiration, detect deprecated protocols, or extract leaf identity[cite: 4].
+
+### Work completed
+
+- Created `internal/scanner/tls.go` to isolate cryptographic inspection from Layer 4 socket worker orchestration.
+- Defined internal `tlsMetadata` value struct encapsulating version, cipher suite, UTC timestamps, and verification status.
+- Implemented `probeTLS(conn net.Conn, targetName string, timeout time.Duration) tlsMetadata`:
+  - Set explicit socket deadlines before handshake initiation to defeat socket tarpits.
+  - Initialized `tls.Config` with `InsecureSkipVerify: true` and `MinVersion: tls.VersionTLS10` to complete handshakes on untrusted or legacy endpoints[cite: 2, 7].
+  - Aggregated standard (`tls.CipherSuites()`) and legacy (`tls.InsecureCipherSuites()`) cipher suites into a zero-allocation package-level slice (`allSupportedCipherSuites`)[cite: 6].
+  - Mapped canonical IANA identifiers via `tls.VersionName()` and `tls.CipherSuiteName()`[cite: 6].
+  - Executed out-of-band X.509 chain verification via `leaf.Verify()` using package-scoped test hook `customRootCAPool`[cite: 2, 7].
+  - Strictly formatted certificate boundaries (`NotBefore`, `NotAfter`) to UTC RFC 3339 strings with trailing `Z`[cite: 10, 11].
+- Updated `internal/models/types.go` adding `TLSVersion`, `CipherSuite`, `CertVerified`, `CertNotBefore`, and `CertNotAfter` to `models.ScanResult`.
+- Wired `probeTLS` into `internal/scanner/worker.go` immediately after successful Layer 4 connection.
+- Standardized Layer 4 state assignment in `worker.go` to lowercase `"open"` matching schema specifications[cite: 1, 9].
+- Built 7-scenario table-driven test suite `TestTLSInspection` in `internal/scanner/tls_test.go` covering TLS 1.3, deprecated TLS 1.0/1.1, expired certificates, self-signed/untrusted authorities, plaintext TCP echo services, and hanging tarpits[cite: 7].
+
+### Problems encountered
+
+#### Premature handshake teardown and metadata loss
+A standard `tls.Dial` or `InsecureSkipVerify: false` handshake terminates immediately upon encountering expired or untrusted certificates, discarding `ConnectionState.PeerCertificates`[cite: 2].
+*Remediation:* Enforced `InsecureSkipVerify: true` during the transport handshake to capture raw peer certificates, followed by out-of-band verification via `leaf.Verify(opts)` to assign `CertVerified` deterministically without failing the probe[cite: 2, 7].
+
+#### Client cipher suite negotiation failure on legacy endpoints (TC-C1-02, TC-C1-03)
+Initial test runs against TLS 1.0 and 1.1 listeners failed with empty metadata because `tlsConn.Handshake()` failed with `tls: no cipher suite supported by both client and server`. Since Go 1.14, the runtime client excludes legacy RSA key exchange and CBC cipher suites from default negotiation.
+*Remediation:* Explicitly merged `tls.CipherSuites()` with `tls.InsecureCipherSuites()` in a package closure, forcing `ClientHello` to advertise legacy suites required for reconnaissance of legacy systems[cite: 6].
+
+#### Test PKI key exchange incompatibility
+The initial test fixture generator hardcoded ECDSA P-256 keys, which legacy TLS 1.0 server configurations could not negotiate with RSA ciphers.
+*Remediation:* Split key generation to support both RSA-2048 and ECDSA P-256, and implemented a 2-tier PKI generator (`generateTestCA` and `generateTestLeaf`) binding loopback IPs and hostnames to SAN extensions by default[cite: 7].
+
+#### Watchdog deadlock in test harness
+`Worker` was initially invoked synchronously on the test goroutine, preventing the watchdog `select` block from catching hanging sockets.
+*Remediation:* Spawned `Worker` in a separate goroutine (`go Worker(...)`), ensuring socket timeouts trigger the test context cancellation cleanly.
+
+### Decisions I made
+
+- **Reconnaissance Inversion Principle:** Web browsers fail closed to protect users; an attack-surface scanner must intentionally support broken/deprecated ciphers to expose vulnerabilities without losing visibility[cite: 2].
+- **Non-Fatal Probe Invariant:** Handshake failures on plaintext ports, timeouts, and cryptographic anomalies must return zero-value `tlsMetadata{}` and retain `res.State = "open"`[cite: 4, 7].
+- **Zero-Allocation Suite Aggregation:** Merged supported cipher suite IDs inside a package-level `var` closure executed once at startup, avoiding slice allocation overhead across high-throughput worker loops.
+- **Strict Stream Separation:** No diagnostic logging or errors emitted on stdout during probe failures, preserving pure NDJSON streams for downstream SIEM consumers[cite: 1, 6, 8].
+
+### Evidence
+
+- Implementation files:
+  - `internal/scanner/tls.go`
+  - `internal/scanner/tls_test.go`
+  - `internal/scanner/worker.go`
+  - `internal/models/types.go`
+- Verification commands:
+
+```bash
+gofmt -w internal/scanner/ internal/models/
+go test -v ./internal/scanner -run TestTLSInspection
+go test -race -v ./internal/scanner -run TestTLSInspection
+go vet ./...
+
+### Observed output:
+
+        All 7 test cases passed (ok github.com/CryToSky1324/TcpRecon/internal/scanner 4.290s).
+
+        Zero race conditions detected under go test -race.
+
+        Zero static analysis issues reported by go vet.
+
+### Remaining limitation
+
+Telemetry enrichment is confined to cryptographic metadata. Target context (CIDR-to-asset mapping, owner, criticality tier) and risk scoring are not yet integrated into the lifecycle pipeline. These belong to Phase C.2 and C.3.
+
+### What I learned
+
+Transport establishment and trust validation are completely separate concerns. Treating an unverified or expired certificate as a fatal dial error introduces critical blind spots into attack surface discovery.
+
+Furthermore, Go's secure-by-default standard library actively works against network reconnaissance tools by hiding legacy ciphers; a security scanner must explicitly override standard client policies to discover deprecated perimeter exposures.
+
+---------------------------------------------------------------------------------
+
+## 2026-09-08: Phase C.2 Asset Inventory Enrichment & Lifecycle NDJSON Plumbing
+
+### Goal
+Inject rich context into runtime discoveries by matching discovered IPs against an authoritative logical topology, and wire the entire event emission pipeline directly to `stdout`.
+
+### Work Completed
+- Built zero-allocation `Matcher` using `netip.Prefix` and Longest Prefix Matching (LPM) logic inside `internal/enrichment`.
+- Authored configuration parsers `LoadRulesFromJSON` and `LoadRulesFromFile` with fail-safe `"unassigned"` fallbacks.
+- Re-routed the entire event generation logic using `scanner.EmitLifecycleChanges`, officially connecting internal `ServiceChange` structures to formatted NDJSON.
+- Plumbed `-asset-rules` flag from CLI boundary down to state reconciliation sinks.
+- Altered test assertions in `cmd/tcprecon` to strictly monitor B7 stdout telemetry boundary rules.
+
+### Decisions I Made
+Enrichment happens in the engine, not the SIEM. Expecting downstream platforms to execute dynamic multi-CIDR regex matching imposes brutal performance penalties on the ingestion pipeline. Pre-enriching the telemetry directly during discovery allows OpenSearch to query fields natively.
+
+---------------------------------------------------------------------------
+
+## 2026-09-09: Phase C.3 Explainable Risk Scoring Engine
+
+### Goal
+Provide mathematical, bounded, deterministic risk scores and categorically defined severity mapped dynamically per asset exposure.
+
+### Work Completed
+- Created `internal/risk` package modeling deterministic scoring (Policy Version `1.0`).
+- Mapped explicit threat weights: exposed datastores (+40), remote admin ports (+35), cleartext protocols (+15), deprecated TLS (+30), unverified certificates (+20).
+- Applied asset context multipliers natively (`tier-0` adds +20, `tier-1` adds +10).
+- Enforced a hard remediation gate: `service.closed` resets final scores to `0` and assigns `"informational"`.
+- Wired `risk.EvaluateRisk` across all `mapDeltaToLifecycleEvent` branches.
+- Verified repository tests with `go test -race -count=1 ./...` and `go vet ./...`.
+
+### Problem Encountered
+Our initial architecture drafted `Reasons` as a JSON array (`"reasons": []`). Running this payload against Wazuh `wazuh-analysisd` parsers invokes critical structural flattening defects.
+
+### Decisions I Made
+Enforced a "Zero-Nested-Arrays" invariant. The `RiskMeta` envelope now restricts `Reasons` to a single comma-delimited scalar string (`"reasons": "deprecated_tls,exposed_datastore"`). This guarantees full compatibility with Wazuh JSON decoders while preserving keyword-searchability in Elasticsearch/OpenSearch platforms.

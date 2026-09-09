@@ -9,6 +9,7 @@ import (
 
 	"github.com/CryToSky1324/TcpRecon/internal/enrichment"
 	"github.com/CryToSky1324/TcpRecon/internal/models"
+	"github.com/CryToSky1324/TcpRecon/internal/risk"
 	"github.com/cespare/xxhash/v2"
 )
 
@@ -116,6 +117,12 @@ func mapDeltaToLifecycleEvent(
 		Owner:       owner,
 	}
 
+	// curr holds target metrics for active services; prior holds metrics if curr is nil (service.closed)
+	targetResult := curr
+	if targetResult == nil {
+		targetResult = prior
+	}
+
 	// B7-01, B7-07, B7-08: New Discovery
 	// A service is brand-new if:
 	// 1. prior is nil
@@ -145,6 +152,7 @@ func mapDeltaToLifecycleEvent(
 				Type:          "new_service",
 				PreviousState: "closed",
 			},
+			Risk: risk.EvaluateRisk("service.opened", curr, asset.Criticality),
 		}, nil
 	}
 
@@ -173,6 +181,7 @@ func mapDeltaToLifecycleEvent(
 					Type:          "service_mutation",
 					PreviousState: "open",
 				},
+				Risk: risk.EvaluateRisk("service.changed", curr, asset.Criticality),
 			}, nil
 		}
 		// Nothing updated or emitted if identical
@@ -203,6 +212,7 @@ func mapDeltaToLifecycleEvent(
 				Type:          "service_reopened",
 				PreviousState: "closed",
 			},
+			Risk: risk.EvaluateRisk("service.reopened", curr, asset.Criticality),
 		}, nil
 	}
 
@@ -239,6 +249,7 @@ func mapDeltaToLifecycleEvent(
 				Type:          "service_closed",
 				PreviousState: "open",
 			},
+			Risk: risk.EvaluateRisk("service.closed", targetResult, asset.Criticality),
 		}, nil
 	}
 	return nil, nil
