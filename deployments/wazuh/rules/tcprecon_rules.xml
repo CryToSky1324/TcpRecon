@@ -1,0 +1,60 @@
+<group name="tcprecon">
+
+  <!-- 100050: Base Parent Anchor -->
+  <rule id="100050" level="3">
+    <if_sid>86600</if_sid>
+    <field name="scanner.name">^tcprecon$</field>
+    <description>Network scanner activity detected from tcprecon.</description>
+  </rule>
+
+  <!-- 100051 - 100054: Event Type Children (depend on 100050 via if_sid) -->
+  <rule id="100051" level="3">
+    <if_sid>100050</if_sid>
+    <field name="event_type">^service\.opened$</field>
+    <description>service.opened</description>
+  </rule>
+
+  <rule id="100052" level="4">
+    <if_sid>100050</if_sid>
+    <field name="event_type">^service\.changed$</field>
+    <description>service.changed</description>
+  </rule>
+
+  <rule id="100053" level="3">
+    <if_sid>100050</if_sid>
+    <field name="event_type">^service\.reopened$</field>
+    <description>service.reopened</description>
+  </rule>
+
+  <rule id="100054" level="2">
+    <if_sid>100050</if_sid>
+    <field name="event_type">^service\.closed$</field>
+    <description>service.closed</description>
+  </rule>
+
+  <!-- 100055 - 100057: Risk Score Escalations -->
+  <rule id="100055" level="8">
+    <if_sid>100051,100052,100053</if_sid>
+    <field name="risk.score" type="pcre2">^([3-5][0-9])$</field>
+    <description>Scanner activity: Medium risk service connection opened ($(risk.score)).</description>
+  </rule>
+
+  <rule id="100056" level="10">
+    <if_sid>100051,100052,100053</if_sid>
+    <field name="risk.score" type="pcre2">^([6-7][0-9]|8[0-4])$</field>
+    <description>Scanner activity: High risk service connection opened ($(risk.score)).</description>
+  </rule>
+
+  <rule id="100057" level="12">
+    <if_sid>100051,100052,100053</if_sid>
+    <field name="risk.score" type="pcre2">^(8[5-9]|9[0-9]|100)$</field>
+    <description>Scanner activity: Critical risk service connection opened ($(risk.score)).</description>
+  </rule>
+
+
+  <rule id="100058" level="10">
+    <if_sid>100050</if_sid>
+    <field name="risk.reasons" type="pcre2">\bdeprecated_tls\b</field>
+    <description>TcpRecon: Insecure or deprecated cryptographic protocol detected.</description>
+  </rule>
+</group>

@@ -1,0 +1,6 @@
+<ossec_config>
+  <localfile>
+    <log_format>json</log_format>
+    <location>/var/log/tcprecon/events.ndjson</location>
+  </localfile>
+</ossec_config>
