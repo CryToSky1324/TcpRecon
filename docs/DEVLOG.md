@@ -970,3 +970,41 @@ Our initial architecture drafted `Reasons` as a JSON array (`"reasons": []`). Ru
 
 ### Decisions I Made
 Enforced a "Zero-Nested-Arrays" invariant. The `RiskMeta` envelope now restricts `Reasons` to a single comma-delimited scalar string (`"reasons": "deprecated_tls,exposed_datastore"`). This guarantees full compatibility with Wazuh JSON decoders while preserving keyword-searchability in Elasticsearch/OpenSearch platforms.
+
+--------------------------------------------------
+
+## 2026-09-11: Phase D — Wazuh SIEM Native Ingestion & Detection Engineering
+
+### Goal
+Deploy the verified Phase C NDJSON telemetry stream into a live Wazuh manager, implement hierarchical detection rules (100050–100058), and automate the installation lifecycle with pre-flight safety gates.
+
+### Starting State
+Phase C verified and merged into `main`. Clean Ubuntu Server 24.04 host available with Wazuh Manager installed, but lacking custom decoders, rules, and ingestion configuration for TcpRecon.
+
+### Work Completed
+- Configured native JSON `<localfile>` ingestion targeting `/var/log/tcprecon/events.ndjson`.
+- Authored `tcprecon_rules.xml` utilizing PCRE2 boundary matching (`\bdeprecated_tls\b`) and dynamic score interpolation.
+- Verified rule routing offline using `wazuh-logtest` across positive, negative, and cryptographic fixtures.
+- Created `deployments/wazuh/scripts/install-rules.sh` and `uninstall-rules.sh`.
+- Tuned OpenSearch JVM heap to 2GB and applied systemd startup timeout overrides.
+- Injected live telemetry into `/var/log/tcprecon/events.ndjson` and confirmed alert generation in `/var/ossec/logs/alerts/alerts.json`.
+
+### Problems Encountered & Decisions Made
+1. **Unanchored Relative Paths in Deployment Scripts:**
+   - *Problem:* `install-rules.sh` initially relied on `../../..` to locate the source XML rules. When executed from extracted deployment archives, the path resolved to `/home/deployments/...`, failing with `FATAL: Source rule file not found`.
+   - *Decision:* Implemented hierarchical path detection in Bash that checks sibling directories (`../rules/`), monorepo paths, and home directory staging.
+2. **`ossec.conf` Truncation from Multi-Line `sed`:**
+   - *Problem:* `uninstall-rules.sh` used regex substitution to strip the `<localfile>` block. It deleted the opening `<location>` line but left an unclosed `<localfile><log_format>json</log_format></ossec_config>`, corrupting the XML tree and causing `wazuh-analysisd` to fail with error `(1226)`.
+   - *Decision:* Replaced regex-based deletion with an embedded Python script utilizing `xml.etree.ElementTree` to parse the XML DOM, remove the targeted element, and rewrite the configuration safely.
+3. **Pre-flight Syntax Gates:**
+   - *Problem:* Deployment scripts previously restarted `wazuh-manager` unconditionally, leading to service outages when configuration errors occurred.
+   - *Decision:* Gated all service reloads behind `/var/ossec/bin/wazuh-analysisd -t`. If syntax checks fail, the script halts immediately without restarting the daemon.
+
+### Evidence
+- Rule 100058 verified via `wazuh-logtest` on `deprecated-tls.ndjson` (Level 10 alert).
+- Rule 100054 verified via `wazuh-logtest` on `service-closed.ndjson` (Level 2 informational event).
+- Negative control `foreign-event.ndjson` evaluated without triggering any alert rules.
+- Live probe confirmed via `tail -n 25 /var/ossec/logs/alerts/alerts.json` showing Rule 100056 firing on port 3306.
+
+### Remaining Limitations
+Wazuh Indexer and Dashboard require explicit heap pinning to stay stable on low-memory laptop lab environments. Visual dashboards and index pattern management remain to be established in Phase E.

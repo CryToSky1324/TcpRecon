@@ -1,75 +1,70 @@
-# 01_Current_Sprint: Phase C Enrichment and Risk Scoring Foundation
+# 01_Current_Sprint: Wazuh Ingestion & Analytics Pipeline
 
-**Updated:** 09 September 2026
+**Updated:** 12 September 2026
 **Status:** ACTIVE
-**Active branch:** `feat/phase-c-tls-enrichment`
-**Current workstream:** Phase C complete — preparing for Phase D (Reproducible Wazuh Integration)
+**Active branch:** `feat/phase-d-wazuh-integration` (Ready for merge to `main`)
+**Current workstream:** Phase D complete — Transitioning to Phase E (OpenSearch Analytics & Dashboards)
 
-## Sprint goal
+## Sprint Goal
 
-Enhance the Phase B lifecycle foundation by integrating deterministic Layer 7 cryptographic inspection, asset inventory enrichment, and multi-factor explainable risk scoring directly into the scanner engine. The scanner must emit enriched, pre-scored telemetry via an active NDJSON event bus without violating SIEM ingestion constraints.
+Deploy reproducible Wazuh SIEM detection, native NDJSON ingestion, and deployment automation on Ubuntu Server 24.04 without crashing `wazuh-analysisd` or dropping telemetry. Transition raw Layer 4/7 state deltas into actionable security alerts.
 
 ---
 
-## Verified starting baseline
+## Verified Starting Baseline
 
-### Phase B: Service Lifecycle and Remediation Detection
-
-**Status:** COMPLETE
+### Phase C: Contextual Enrichment & Explainable Risk Scoring
+**Status:** COMPLETE (Merged into `main`)
 
 Verified work includes:
-- Stable `scope_id` and `service_key` derivation.
-- Versioned bbolt state metadata and baseline persistence.
-- Successful-scan-gated lifecycle reconciliation (`service.opened`, `service.changed`, `service.closed`, `service.reopened`).
-- Phase B builds on this baseline rather than reopening lifecycle core logic without new evidence.
+- Non-fatal Layer 7 TLS inspection (version, cipher suites, validity timestamps).
+- Zero-alloc LPM CIDR `Matcher` for asset identity mapping (`asset.environment`, `asset.criticality`).
+- Deterministic 0–100 risk scoring with strict remediation gating (`service.closed` forced to 0).
+- Pure NDJSON telemetry stream adhering strictly to `docs/EVENT_SCHEMA.md`.
 
 ---
 
-## Phase C progress
+## Phase D Progress
 
-### C.1: Non-Fatal TLS Inspection
+### D.1: Telemetry Plumbing & Rule Hierarchy
 **Status:** COMPLETE — IMPLEMENTED AND VERIFIED
 
-- [x] Extract `TLSVersion`, `CipherSuite`, and certificate validity timestamps.
-- [x] Configure out-of-band X.509 verification against custom root pools.
-- [x] Aggregate standard and insecure cipher suites to detect deprecated TLS 1.0/1.1 endpoints.
-- [x] Ensure non-fatal fallback (retain Layer 4 `open` state on TLS handshake timeouts/failures).
+- [x] Configured native `<localfile>` NDJSON ingestion path for `/var/log/tcprecon/events.ndjson`.
+- [x] Implemented hierarchical detection rules (`100050`–`100058`) anchored to Suricata parent rule `86600`.
+- [x] Added dynamic description interpolation for `data.risk.score` across Low, Medium, and High thresholds.
+- [x] Mapped specific threat reasons (`deprecated_tls`, `untrusted_cert`) to escalated severity (Rule `100058`, Level 10).
+- [x] Created offline test fixtures under `deployments/wazuh/fixtures/` covering open, closed, changed, and cryptographic findings.
+- [x] Verified full offline rule compilation and alert triggering via `wazuh-logtest`.
 
-### C.2: Asset Inventory Enrichment & NDJSON Pipeline
+### D.2: Deployment Automation & Engine Hardening
 **Status:** COMPLETE — IMPLEMENTED AND VERIFIED
 
-- [x] Implement zero-allocation Longest Prefix Match (LPM) CIDR `Matcher`.
-- [x] Author robust `LoadRulesFromFile` and `LoadRulesFromJSON` configuration parsers with `"unassigned"` safe fallbacks.
-- [x] Export `EmitLifecycleChanges` to stream reconciled deltas unconditionally to `stdout` as NDJSON.
-- [x] Wire `-asset-rules` CLI flag through execution bounds.
-
-### C.3: Deterministic Explainable Risk Scoring
-**Status:** COMPLETE — IMPLEMENTED AND VERIFIED
-
-- [x] Implement `internal/risk` package evaluating ports, TLS posture, and asset criticality multipliers.
-- [x] Bound integer `score` between 0 and 100 with dynamic `severity` thresholds.
-- [x] Enforce Remediation Gate: `service.closed` strictly resets score to 0 (`severity: "informational"`).
-- [x] Enforce Zero-Nested-Arrays Invariant: Serialize `reasons` as a comma-delimited scalar string.
-- [x] Map `models.RiskMeta` envelope directly into the canonical lifecycle event structure.
+- [x] Authored portable `install-rules.sh` and `uninstall-rules.sh` lifecycle scripts under `deployments/wazuh/scripts/`.
+- [x] Resolved path-resolution bugs using multi-tier fallback detection across standalone and monorepo checkouts.
+- [x] Replaced fragile multi-line `sed` expressions with Python DOM XML parsers to prevent `ossec.conf` corruption.
+- [x] Enforced `wazuh-analysisd -t` pre-flight syntax gates prior to restarting daemon services.
+- [x] Stabilized low-memory laptop host (pinned JVM heap to 2GB, configured startup timeouts).
+- [x] Executed end-to-end live probe: injected raw NDJSON into `/var/log/tcprecon/events.ndjson` and confirmed live alert generation in `/var/ossec/logs/alerts/alerts.json`.
 
 ---
 
-## Phase C completion gate
+## Phase D Completion Gate
 
-Phase C is complete only when all of the following are demonstrated:
-- [x] `go test -race -count=1 ./...` passes cleanly across all packages.
-- [x] `go vet ./...` reports zero static analysis failures.
-- [x] `git diff --check` passes with zero whitespace defects.
-- [x] Output strictly segregates pure NDJSON lifecycle events on `stdout` and diagnostic summaries on `stderr`.
-- [x] Emitted events contain no JSON arrays/slices that break `wazuh-analysisd` compatibility.
+Phase D is complete only when all of the following are demonstrated:
+- [x] `deployments/wazuh/` directory structured cleanly with rules, fixtures, config, and scripts.
+- [x] `wazuh-logtest` passes all positive and negative control fixtures.
+- [x] `install-rules.sh` and `uninstall-rules.sh` run idempotently with exit code 0.
+- [x] Live log sink tails and generates verified alerts in `/var/ossec/logs/alerts/alerts.json`.
+- [x] No manual XML edits required; configuration changes survive daemon restarts.
 
-**Gate status:** PASSED
+**Gate Status:** PASSED
 
 ---
 
-## Immediate next actions
+## Immediate Next Actions (Phase E)
 
-1. Prepare for **Phase D (Reproducible Wazuh Integration)**: Validate clean Ubuntu Server 24.04 environment.
-2. Configure Wazuh `<localfile>` native JSON ingestion path for TCPRecon NDJSON output.
-3. Author hierarchical XML rules in `local_rules.xml` matching canonical `service.*` event types and evaluating `risk.score` metrics.
-4. Run comprehensive validation of all fixtures via `wazuh-logtest` before manager restarts.
+1. Merge `feat/phase-d-wazuh-integration` into `main`.
+2. Cut feature branch `feat/phase-e-opensearch-analytics`.
+3. Bring `wazuh-indexer` and `wazuh-dashboard` online within the 2GB JVM heap boundary.
+4. Establish the `wazuh-alerts-*` index pattern and verify aggregations for `data.risk.score` and `data.asset.*`.
+5. Construct visualization dashboards tracking exposure lifecycles, risk scores, and deprecated cryptographic findings.
