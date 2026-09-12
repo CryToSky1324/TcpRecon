@@ -1,0 +1,46 @@
+{
+  "order": 10,
+  "index_patterns": [
+    "wazuh-alerts-4.x-*"
+  ],
+  "settings": {
+    "index": {
+      "number_of_shards": "1"
+    }
+  },
+  "mappings": {
+    "properties": {
+      "data": {
+        "properties": {
+          "event_type": { "type": "keyword" },
+          "timestamp": { "type": "date" },
+          "asset": {
+            "properties": {
+              "ip": { "type": "ip" },
+              "hostname": { "type": "keyword" },
+              "environment": { "type": "keyword" },
+              "criticality": { "type": "keyword" },
+              "owner": { "type": "keyword" }
+            }
+          },
+          "network": {
+            "properties": {
+              "ip": { "type": "ip" },
+              "port": { "type": "integer" },
+              "protocol": { "type": "keyword" },
+              "state": { "type": "keyword" }
+            }
+          },
+          "risk": {
+            "properties": {
+              "score": { "type": "integer" },
+              "severity": { "type": "keyword" },
+              "reasons": { "type": "keyword" },
+              "policy_version": { "type": "keyword" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
