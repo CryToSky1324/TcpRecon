@@ -12,7 +12,7 @@ The project is not intended to outperform or replace mature scanners. Its engine
 network observation → normalized state → asset enrichment → risk scoring → lifecycle event → detection → analysis → remediation evidence
 ```
 
-The scanner, stable identity helpers, explicit scan-completion boundary, versioned lifecycle-state subsystem, Layer 7 TLS inspection, LPM asset enrichment, deterministic risk engine, and Wazuh detection pipeline (rules 100050–100058 with automated lifecycle scripts) are runtime-active and verified. OpenSearch remediation analytics and visual dashboards remain the subsequent stage of the vertical slice.
+The scanner, stable identity helpers, explicit scan-completion boundary, versioned lifecycle-state subsystem, Layer 7 TLS inspection, LPM asset enrichment, deterministic risk engine, Wazuh detection pipeline (rules 100050–100058 with automated lifecycle scripts), and OpenSearch remediation analytics with visual dashboards are now runtime-active and verified.
 
 ## 2. Design principles
 
@@ -91,7 +91,7 @@ Verified Phase D completion behaviour:
 
 ### 3.2 Target lifecycle vertical slice
 
-**Status: planned (Phase E).**
+**Status: implemented and verified (Phase E).**
 
 ```mermaid
 flowchart LR
@@ -108,19 +108,10 @@ A cancelled, failed, partial, or unresolved scan must preserve the previous comm
 | Workstream | Result | Status |
 | --- | --- | --- |
 | **Phase A: Repository baseline** | Input parsing, CLI validation, IPv6 safety, stdout/stderr stream separation, unit & race test suite. | Complete and verified |
-| **Phase B1: Trace data flow** | Traced CLI input, dispatch, workers, results channel, state manager, bbolt updates, and failure boundaries. | Complete analysis |
-| **Phase B2: Lifecycle contracts** | Defined `service.opened`, `service.changed`, `service.closed`, `service.reopened`, baseline semantics, and commit rules. | Complete on paper |
-| **Phase B3: Scan-scope identity** | Implemented and unit-tested deterministic `ScanScope.ID()` from canonical targets plus separate TCP/UDP port sets. | Runtime-active and verified |
-| **Phase B4: Service identity** | Implemented and unit-tested deterministic `ServiceIdentity.Key()` from `scope_id`, canonical IP, port, and protocol. | Runtime-active and verified |
-| **Phase B5: Explicit scan completion** | Implemented `ScanCompletion`, explicit failure statuses, producer/router/worker outcome propagation, and CLI success gating. | Implemented and verified |
-| **Phase B6: Versioned state** | Implemented schema-v1 metadata, scoped baseline/current storage, successful-scan-gated reconciliation, and CLI integration. | Complete, runtime-active, and verified |
-| **Phase B7: Lifecycle event emission** | Implemented canonical NDJSON lifecycle emission adhering strictly to `docs/EVENT_SCHEMA.md`. | Complete, runtime-active, and verified |
-| **Phase C1: Layer 7 TLS inspection** | Non-fatal TLS handshake inspection extracting versions, ciphers, validity windows, and certificate authority status. | Complete, runtime-active, and verified |
-| **Phase C2: Asset enrichment** | Zero-allocation Longest Prefix Match (LPM) CIDR routing table applying local asset context (`environment`, `criticality`, `owner`). | Complete, runtime-active, and verified |
-| **Phase C3: Deterministic risk scoring** | Deterministic 0–100 explainable scoring engine, remediation gating (score reset to 0), and scalar reason serialization. | Complete, runtime-active, and verified |
-| **Phase D1: Wazuh detection ruleset** | Authored hierarchical rules (`100050`–`100058`), native JSON `<localfile>` ingestion, and positive/negative test fixtures. | Complete and verified |
-| **Phase D2: Lifecycle deployment scripts** | Hardened `install-rules.sh` and DOM-safe `uninstall-rules.sh`, pre-flight syntax gates, and live `alerts.json` alert confirmation. | Complete and verified |
-| **Phase E: OpenSearch analytics** | Schema mappings, index patterns (`wazuh-alerts-*`), and visual remediation analytics dashboards. | Planned |
+| **Phase B1-B7: Lifecycle state** | Stable identities, versioned bbolt baseline, lifecycle event NDJSON emission. | Complete and verified |
+| **Phase C1-C3: TLS & Risk** | Non-fatal TLS probes, zero-alloc LPM CIDR engine, deterministic 0–100 scoring. | Complete and verified |
+| **Phase D1-D2: Wazuh Detection** | Rules 100050–100058, `<localfile>` NDJSON pipeline, XML DOM safety. | Complete and verified |
+| **Phase E: OpenSearch Analytics** | Schema mappings, index patterns (`wazuh-alerts-*`), visual remediation analytics dashboards. | Complete, runtime-active, and verified |
 
 The active identity chain is:
 
@@ -393,24 +384,49 @@ deployments/wazuh/
 - `install-rules.sh`: Shell installer supporting portable relative paths. Stages rules, prepares `/var/log/tcprecon/events.ndjson` with `wazuh:wazuh` ownership, injects the `<localfile>` stanza, gates reloads behind `/var/ossec/bin/wazuh-analysisd -t`, and restarts `wazuh-manager`.
 - `uninstall-rules.sh`: Safe uninstallation script using Python's `xml.etree.ElementTree` DOM parser to cleanly excise the `<localfile>` entry without regex truncation, validates syntax, and restarts `wazuh-manager`.
 
-## 8. OpenSearch analytics
+## 8. OpenSearch Analytics Architecture (Phase E)
 
-Status: planned and dependent on reproducible Wazuh ingestion.
+**Status: implemented and operational on indexer and dashboards (Phase E verified).**
 
-Dashboard-critical fields require explicit mappings:
+### 8.1 Index Template Overlay Pattern
 
-| Field type | Mapping |
-| --- | --- |
-| IP address (`data.asset.ip`) | `ip` |
-| Port, risk score (`data.network.port`, `data.risk.score`) | numeric (`integer` / `long`) |
-| Timestamps (`data.timestamp`) | `date` |
-| Event type, severity, reason code (`data.event_type`, `data.risk.severity`) | `keyword` |
-| Owner, environment, criticality (`data.asset.*`) | `keyword` |
-| Explanations and long banners | `text` plus bounded keyword fields only where justified |
+To enforce strict schema typing on TcpRecon telemetry without modifying vendor-managed Wazuh templates (`wazuh`, running at `order: 0`), an overlay index template is registered:
 
-Numeric fields should not be forced into `.keyword` mappings. FieldData should not be enabled merely to aggregate analyzed text.
+* **Template Name:** `tcprecon-alerts`
+* **Pattern:** `wazuh-alerts-4.x-*`
+* **Precedence:** `order: 10` (overrides base settings while merging unmapped fields)
+* **File Location:** `deployments/wazuh/templates/tcprecon-alerts-template.json`
 
-Planned dashboards include current exposure, service changes, unresolved risk, deprecated TLS, certificate expiry, and remediation duration.
+### 8.2 Strict Schema Mapping Invariants
+
+The overlay explicitly establishes Doc Values-backed types to guarantee high-performance aggregations without JVM FieldData memory exhaustion:
+
+| Telemetry Field | Target Type | Invariant Reason |
+| :--- | :--- | :--- |
+| `data.risk.score` | `integer` | Required for numeric histograms, range buckets, and risk averages. |
+| `data.network.port` | `integer` | Prevents mapping collisions between scalar ports and nested port objects. |
+| `data.asset.ip` | `ip` | Enables CIDR mask filtering and geo/network range queries. |
+| `data.timestamp` | `date` | Enables timeline aggregations independent of log receipt time. |
+| `data.event_type` | `keyword` | Exact-match bucket slicing (`service.opened` vs `service.closed`). |
+| `data.risk.severity` | `keyword` | Ordinal risk tier grouping (`informational`, `low`, `medium`, `high`, `critical`). |
+| `data.asset.criticality`| `keyword` | Asset impact aggregation. |
+| `data.risk.reasons` | `keyword` | Delimited token filtering without analyzed full-text overhead. |
+
+### 8.3 JVM Heap & Lucene Shard Sizing Constraints
+
+To operate reliably on resource-constrained single-node hardware pinned to a 2GB JVM heap (`-Xms2g -Xmx2g`):
+* **Single Shard Pinning:** `settings.index.number_of_shards: 1` is strictly enforced via the template overlay.
+* **Heap Protection:** Mitigates Lucene term dictionary fragmentation and cluster state memory inflation across daily rolling indices.
+* **Doc Values Invariant:** Visualizations and queries must exclusively target `keyword`, `integer`, `ip`, and `date` types backed by on-disk Doc Values, eliminating Lucene in-memory un-inversion. Root queries enforce `"size": 0`.
+
+### 8.4 Visual Remediation Analytics Lenses & Master Dashboard
+
+Visual analytics are codified as OpenSearch Dashboards Saved Objects under `deployments/wazuh/dashboards/`:
+
+1. **Lens 1 — Exposure Lifecycles (`lens1-lifecycles.json`):** Stacked date histogram (`@timestamp` with daily auto-intervals) split by `data.event_type`, tracking exposure velocity (`service.opened`, `service.changed`, `service.closed`).
+2. **Lens 2 — Risk Distribution (`lens2-risk-distribution.json`):** Numeric histogram on `data.risk.score` (10-point bucket interval) sub-aggregated by `data.risk.severity` (`critical`, `high`, `medium`, `low`, `informational`).
+3. **Lens 3 — High-Risk Cryptographic Findings (`lens3-crypto-findings.json`):** Terms-aggregated data table tracking `data.asset.hostname` and `data.network.port` matching Rule `100058` or `*deprecated_tls*`, sorted by `max(data.risk.score)`.
+4. **Master Dashboard (`tcprecon-attack-surface-overview.json`):** Unified "Attack Surface Intelligence" master dashboard combining all three lenses in a 48-unit responsive grid layout, referencing persistent saved objects without dynamic un-versioned UI dependencies.
 
 ## 9. Deployment architecture
 
@@ -534,6 +550,4 @@ Until the vertical slice is complete, the project will not prioritize:
 
 ## 14. Historical evolution
 
-The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based observation suppression, and added container and Kubernetes deployment baselines. Phase B established stable scope/service identity, versioned state, and successful-scan-only baseline promotion in the CLI. Phase C introduced Layer 7 TLS inspection, LPM asset enrichment, and deterministic 0–100 risk scoring. Phase D implemented native Wazuh SIEM JSON ingestion, hierarchical detection rules (100050–100058), DOM-safe deployment scripts, and verified live alert generation in `alerts.json`.
-
-OpenSearch analytics and dashboard visualization remain target work for Phase E.
+The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based observation suppression, and added container and Kubernetes deployment baselines. Phase B established stable scope/service identity, versioned state, and successful-scan-only baseline promotion in the CLI. Phase C introduced Layer 7 TLS inspection, LPM asset enrichment, and deterministic 0–100 risk scoring. Phase D implemented native Wazuh SIEM JSON ingestion, hierarchical detection rules (100050–100058), DOM-safe deployment scripts, and verified live alert generation in `alerts.json`. Phase E established the `wazuh-alerts-*` index pattern, enforced Doc Values aggregations to protect the 2GB JVM heap, and deployed the master TcpRecon Attack Surface Intelligence dashboard.

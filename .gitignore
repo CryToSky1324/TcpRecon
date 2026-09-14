@@ -1,4 +1,5 @@
 # 1. Compiled Go Binaries
+.agents
 /tcprecon
 bin/
 *.exe
@@ -8,6 +9,5 @@ bin/
 # 2. Target Lists & Operational Data
 targets.txt
 *.csv
-
-*.json
 *.db
+

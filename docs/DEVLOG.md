@@ -1008,3 +1008,71 @@ Phase C verified and merged into `main`. Clean Ubuntu Server 24.04 host availabl
 
 ### Remaining Limitations
 Wazuh Indexer and Dashboard require explicit heap pinning to stay stable on low-memory laptop lab environments. Visual dashboards and index pattern management remain to be established in Phase E.
+
+--------------------------------------------------------------------
+
+## 2026-09-14: Phase E.1 — OpenSearch Health Audit & Template Overlay Hardening
+
+### Goal
+Audit `wazuh-indexer` health, verify shard recovery under pinned 2GB JVM heap bounds, and enforce strict type mappings on incoming TcpRecon telemetry (`data.*`).
+
+### Problems Encountered
+1. **Authentication & Socket Rejection:** Initial REST API health checks using default basic auth (`admin:admin`) returned `HTTP 401 Unauthorized` due to customized OpenSearch Security Plugin credentials.
+2. **Dynamic Typing Failure on `data.risk.score`:** The active index (`wazuh-alerts-4.x-2026.09.11`) mapped `data.risk.score` as `"type": "keyword"`. The base vendor template (`wazuh`, `order: 0`) lacked explicit `tcprecon` definitions and fell back to dynamic `string_as_keyword` typing, preventing numerical metric aggregations and histograms.
+3. **Shard Oversubscription on Constrained Node:** The base template created 3 primary shards per daily index, allocating 37 shards on a single-node cluster with only a 2GB JVM heap.
+4. **Mapping Immutability during Verification:** After applying the overlay template, tests initially failed because Filebeat was indexing into the active index for the current day (`wazuh-alerts-4.x-2026.09.12`), which had been initialized prior to template registration and locked in the old schema.
+
+### Solutions & Engineering Decisions
+* **mTLS Direct Administrative Access:** Leveraged root administrative client TLS certificates (`/etc/wazuh-indexer/certs/admin.pem` and `admin-key.pem`) to authenticate directly to the indexer API via curl, bypassing basic auth.
+* **Index Template Overlay Architecture:** Authored `deployments/wazuh/templates/tcprecon-alerts-template.json` configured with `order: 10` and targeting `wazuh-alerts-4.x-*`. Because `order: 10` supersedes the base template (`order: 0`), OpenSearch merges the schemas, enforcing `data.risk.score -> integer`, `data.network.port -> integer`, `data.asset.ip -> ip`, and pinning `number_of_shards: 1` without mutating core vendor configurations.
+* **Active Index Purge & Pipeline Verification:** Deleted the polluted `wazuh-alerts-4.x-2026.09.12` index and injected a synthetic NDJSON event into `/var/log/tcprecon/events.ndjson`. The regenerated index correctly initialized with 1 primary shard and verified `data.risk.score` as an `integer`.
+
+### Evidence
+- Template registered: `PUT /_template/tcprecon-alerts` returned `{"acknowledged": true}`.
+- Mapping verified: `GET /wazuh-alerts-4.x-2026.09.12/_mapping/field/data.risk.score` returned `"type": "integer"`.
+- Shard layout verified: `_cat/shards` confirmed index running with a single primary shard (`0 p STARTED 3 docs`).
+
+------------------------------------------------------------------
+
+## 2026-09-14: Phase E.2 — Visual Remediation Analytics Lenses
+
+### Goal
+Author and verify safe OpenSearch DSL queries for three distinct analytics lenses and persist them as OpenSearch Dashboards Saved Objects (`.kibana_1`), strictly enforcing memory invariants to protect the 2GB JVM heap constraint.
+
+### Problems Encountered
+1. **Unmapped Schema Error on Dotted Metadata (`rule_id` vs `rule.id`):**
+   - *Problem:* While drafting the cryptographic findings query (Lens 3), the query used `"rule_id": "100058"`. Wazuh alerts use dotted notation in OpenSearch (`rule.id`), causing the `term` query to match 0 documents.
+   - *Decision:* Corrected the term filter field to `"rule.id"`.
+2. **Wildcard Expansion Failure in Exact `term` Clauses:**
+   - *Problem:* A compound filter attempted to match `*deprecated_tls*` inside a `term` block. Because `term` performs exact byte-for-byte matching without Lucene pattern expansion, it dropped all valid cryptographic findings.
+   - *Decision:* Separated the compound filter into a `bool.should` block with two distinct query types: an exact `term` for `rule.id` and a `wildcard` for `data.risk.reasons`.
+3. **Cross-Site Request Forgery (CSRF) API Rejections:**
+   - *Problem:* Attempting to register the saved object JSON files via `curl POST /api/saved_objects/...` resulted in HTTP 400 `Bad Request: Request must contain the osd-xsrf header`.
+   - *Decision:* Forced the `-H "osd-xsrf: true"` header into both the `/auth/login` session creation request and the subsequent Saved Object API payload submissions.
+
+### Decisions I Made
+* **Memory Protection Invariant (Root Size 0):** Enforced `"size": 0` on every raw DSL aggregation query. All analytics evaluate exclusively against on-disk Doc Values (keywords, integers) rather than pulling `_source` document payloads into the JVM heap.
+* **Separation of Verification from Deployment:** Separated the verification artifacts into `deployments/wazuh/queries/` (for raw `curl` DSL testing) and `deployments/wazuh/dashboards/visualizations/` (for final OpenSearch Dashboards UI state strings).
+
+### Evidence
+- **Lens 1 (Lifecycles):** Registered `tcprecon-lens1-lifecycles` using a stacked date histogram to track `service.opened`, `service.changed`, and `service.closed` over time.
+- **Lens 2 (Risk Distribution):** Registered `tcprecon-lens2-risk-distribution` using a 10-point numeric histogram grouped by qualitative severity (`informational`, `low`, `medium`, `high`, `critical`).
+- **Lens 3 (Crypto Findings):** Registered `tcprecon-lens3-crypto-findings` using nested terms aggregations to isolate `data.asset.hostname` and `data.network.port` exposing deprecated TLS or untrusted certificates.
+
+------------------------------------------------------------------------------------
+
+## 2026-09-14: Phase E.3 — Master Dashboard Assembly
+
+### Goal
+Assemble the verified visualization lenses into a unified "Attack Surface Intelligence" master dashboard and commit the final Phase E architecture state into version control.
+
+### Problems Encountered
+No major architectural blockers occurred during assembly; the primary challenge was correctly mapping internal Dashboard grid references to the UUIDs established during Phase E.2.
+
+### Decisions I Made
+* **Explicit Reference Binding:** Hardcoded the references array in the dashboard saved object to strictly link `panel_0` -> Lens 1, `panel_1` -> Lens 2, and `panel_2` -> Lens 3, avoiding dynamic or brittle UI-generated links.
+* **GitOps Preservation:** Persisted the assembled dashboard JSON into `deployments/wazuh/dashboards/tcprecon-attack-surface-overview.json` to ensure the entire visual pipeline is version-controlled and reproducible outside of the live `.kibana_1` index.
+
+### Evidence
+- Registered the dashboard via `/api/saved_objects/dashboard/tcprecon-attack-surface-overview?overwrite=true`.
+- Visually verified via the web UI (`https://100.124.20.59`) that the Master Dashboard successfully plots time mutations, risk binning, and cryptographic findings simultaneously without crashing the indexer node.
