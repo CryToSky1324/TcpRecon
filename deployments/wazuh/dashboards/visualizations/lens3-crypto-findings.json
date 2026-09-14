@@ -1,0 +1,11 @@
+{
+  "attributes": {
+    "title": "TcpRecon - High-Risk Cryptographic Findings",
+    "description": "Exposed endpoints exhibiting deprecated TLS configurations or untrusted certificates grouped by hostname and port",
+    "visState": "{\"title\":\"TcpRecon - High-Risk Cryptographic Findings\",\"type\":\"table\",\"params\":{\"perPage\":10,\"showPartialRows\":false,\"showMetricsAtAllLevels\":false,\"sort\":{\"columnIndex\":null,\"direction\":null},\"showTotal\":false,\"totalFunc\":\"sum\"},\"aggs\":[{\"id\":\"1\",\"enabled\":true,\"type\":\"max\",\"schema\":\"metric\",\"params\":{\"field\":\"data.risk.score\",\"customLabel\":\"Max Risk Score\"}},{\"id\":\"2\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"bucket\",\"params\":{\"field\":\"data.asset.hostname\",\"size\":10,\"order\":\"desc\",\"orderBy\":\"1\",\"otherBucket\":false,\"missingBucket\":false,\"customLabel\":\"Asset Hostname\"}},{\"id\":\"3\",\"enabled\":true,\"type\":\"terms\",\"schema\":\"bucket\",\"params\":{\"field\":\"data.network.port\",\"size\":5,\"order\":\"desc\",\"orderBy\":\"1\",\"otherBucket\":false,\"missingBucket\":false,\"customLabel\":\"Port\"}}]}",
+    "uiStateJSON": "{}",
+    "kibanaSavedObjectMeta": {
+      "searchSourceJSON": "{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[{\"meta\":{\"index\":\"wazuh-alerts-*\",\"negate\":false,\"disabled\":false,\"alias\":null,\"type\":\"custom\",\"key\":\"custom\"},\"$state\":{\"store\":\"appState\"},\"query\":{\"bool\":{\"should\":[{\"term\":{\"rule.id\":\"100058\"}},{\"wildcard\":{\"data.risk.reasons\":\"*deprecated_tls*\"}}],\"minimum_should_match\":1}}}],\"index\":\"wazuh-alerts-*\"}"
+    }
+  }
+}

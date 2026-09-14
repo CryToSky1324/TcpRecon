@@ -1,0 +1,42 @@
+POST /wazuh-alerts-4.x-*/_search
+{
+  "size":0,
+  "query": {
+    "bool": {
+      "filter": [
+      {
+        "bool": {
+          "should": [
+            { "term": {"rule.id": "100058"}},
+            {"wildcard": {"data.risk.reasons": "*deprecated_tls*"}}
+          ],
+          "minimum_should_match": 1
+          }
+        }
+      ]
+    }
+  },
+  "aggs": {
+    "hostname": {
+      "terms": {
+        "field": "data.asset.hostname",
+        "size": 10
+      },
+      "aggs": {
+        "network_port": {
+          "terms": {
+            "field": "data.network.port",
+            "size": 5
+          },
+          "aggs": {
+            "max_metric_value": {
+              "max": {
+                "field": "data.risk.score"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
