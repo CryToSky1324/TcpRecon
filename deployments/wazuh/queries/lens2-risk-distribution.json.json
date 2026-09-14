@@ -1,0 +1,39 @@
+POST /wazuh-alerts-4.x-*/_search
+{
+  "size":0,
+  "query": {
+    "bool": {
+      "filter": [
+        {
+          "term": {
+            "rule.groups": "tcprecon"
+          }
+        }
+      ]
+    }
+  },
+  "aggs": {
+    "event_risk_score": {
+      "histogram": {
+        "field": "data.risk.score",
+        "interval": 10,
+        "min_doc_count": 0
+      },
+      "aggs": {
+        "event_risk_severity": {
+          "terms": {
+            "field": "data.risk.severity",
+            "size": 5,
+            "include": [
+              "informational",
+              "low",
+              "medium",
+              "high",
+              "critical"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
