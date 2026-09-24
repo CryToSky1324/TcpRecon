@@ -12,7 +12,7 @@ The project is not intended to outperform or replace mature scanners. Its engine
 network observation → normalized state → asset enrichment → risk scoring → lifecycle event → detection → analysis → remediation evidence
 ```
 
-The scanner, stable identity helpers, explicit scan-completion boundary, versioned lifecycle-state subsystem, Layer 7 TLS inspection, LPM asset enrichment, deterministic risk engine, Wazuh detection pipeline (rules 100050–100058 with automated lifecycle scripts), and OpenSearch remediation analytics with visual dashboards are now runtime-active and verified.
+The scanner, stable identity helpers, explicit scan-completion boundary, versioned lifecycle-state subsystem, Layer 7 TLS inspection, LPM asset enrichment, deterministic risk engine, Wazuh detection pipeline (rules 100050–100058 with automated lifecycle scripts), OpenSearch remediation analytics with visual dashboards, and Phase F.1 (offline Layer 7 banner parsers for SSH and HTTP) are now runtime-active and verified. Offline UDP probe generation and worker pipeline refactoring remain the final stages of the vertical slice.
 
 ## 2. Design principles
 
@@ -26,12 +26,14 @@ The scanner, stable identity helpers, explicit scan-completion boundary, version
 8. **Configuration safety contract.** SIEM deployment automation scripts must never use destructive multiline text substitution on `ossec.conf`. XML mutations require structured DOM manipulation and pre-flight validation via `/var/ossec/bin/wazuh-analysisd -t` prior to service reload.
 9. **Reproducible operations.** Wazuh rules, fixtures, mappings, dashboards, and deployment instructions belong in Git under `deployments/`.
 10. **Honest claims.** Performance and reliability claims require tests and published evidence.
+11. **Memory ceiling on untrusted streams:** All Layer 7 application banner readers must wrap untrusted connections in `io.LimitReader` to enforce strict allocation bounds against malicious tarpits and slowloris attacks.
+12. **Offline verifiability:** Protocol parsing and application probes must be completely decoupled from socket dialing to allow deterministic, in-memory testing (`net.Pipe()`, `net.ListenUDP`) without external network dependencies.
 
 ## 3. System context
 
-### 3.1 Current scanner pipeline
+### 3.1 Pipeline Data Flow
 
-**Status: implemented and verified through Phase D live SIEM alerting.**
+**Status: implemented and verified through Phase D live SIEM alerting, Phase E OpenSearch analytics, and Phase F.1 offline parsers.**
 
 ```mermaid
 flowchart LR
@@ -42,9 +44,13 @@ flowchart LR
   Raw --> Router[Protocol router]
   Router --> TCPQ[tcpJobs]
   Router --> UDPQ[udpJobs]
-  TCPQ --> TCP[TCP / TLS worker pool]
+  TCPQ --> TCP[TCP Workers]
+  TCP --> TLS[TLS Inspector]
+  TCP --> L7["Layer 7 Banner Parsers (ParseSSH & ParseHTTP)"]
   UDPQ --> UDP[Selected UDP worker pool]
   TCP --> Results[Positive ScanResults]
+  TLS --> Results
+  L7 --> Results
   UDP --> Results
   Results --> Persist[Temporary observation persister]
   Persist <--> Bolt[(schema-v1 scoped state)]
@@ -75,7 +81,7 @@ flowchart LR
   ServiceDef[ServiceIdentity.Key v1] --> Bolt
 ```
 
-Verified Phase D completion behaviour:
+Verified scanner completion and pipeline behaviour:
 
 - `scanner.Run` exposes the result stream and a separate asynchronous `ScanCompletion` channel;
 - result-channel closure proves result production has ended, but does not by itself prove scan success;
@@ -89,7 +95,95 @@ Verified Phase D completion behaviour:
 - telemetry appends to `/var/log/tcprecon/events.ndjson`, which is actively monitored by `wazuh-logcollector`;
 - `wazuh-analysisd` natively parses fields under `data.*`, evaluates hierarchical rules (100050–100058), and commits security alerts directly to `/var/ossec/logs/alerts/alerts.json`.
 
-### 3.2 Target lifecycle vertical slice
+#### Dispatcher Execution Breakdown
+
+- **Protocol Router:** Consumes unified target jobs from `rawJobs` and dispatches to bounded protocol queues (`tcpJobs`, `udpJobs`).
+- **TCP Workers:** Execute bounded full-connect network dials against active targets.
+- **TLS Inspector:** Conducts non-fatal cryptographic handshakes, extracting negotiated cipher suites, TLS versions, and certificate metadata without dropping observations on handshake failure.
+- **Layer 7 Banner Parsers (`ParseSSH` & `ParseHTTP`):** Execute memory-bounded, protocol-specific banner interrogation over established streams (RFC 4253 SSH banner validation, minimal HTTP GET probe injection with case-insensitive `Server:` header extraction and status fallback).
+- **Selected UDP Workers:** Dispatch stateless, protocol-aware probe datagrams and evaluate conservative service replies.
+
+#### Pipeline Execution Stages
+
+##### Input Source Selection
+
+Target input may originate from a positional target, local file, standard input, or an authorised remote list. Input-source selection must be explicit and mutually unambiguous.
+
+Required behaviour:
+- reject multiple conflicting sources;
+- reject excessive positional arguments;
+- validate URLs before network fetching;
+- resolve hostnames without terminating the whole process on one failure;
+- preserve target identity alongside resolved addresses;
+- stream large sources instead of loading them completely into memory.
+
+##### Streaming Parser
+
+The parser reads through `io.Reader` and produces scan jobs. Large individual CIDRs should eventually be expanded incrementally so producer memory remains bounded.
+
+The parser is subject to backpressure. When work queues fill, parsing pauses until workers consume jobs.
+
+`StreamTargets` preserves these scan-level conditions:
+- context cancellation;
+- target parse/job-production failure;
+- target-resolution failure;
+- underlying input-reader failure, classified under the parse/production boundary;
+- `nil` when target production completes successfully.
+
+The producer-side send path checks `ctx.Err()` before a context-aware channel send to avoid selection races on cancellation.
+
+##### Dispatcher and Worker Pools
+
+The dispatcher routes jobs to protocol-specific worker pools.
+
+- TCP workers use full-connect scanning through context-aware dials.
+- UDP workers send selected protocol-aware payloads and classify positive replies conservatively.
+- Channel direction types document ownership and prevent accidental misuse.
+- `sync.WaitGroup` and channel-closure ownership are centralised.
+- Worker counts are validated and bounded.
+
+Asynchronous stage outcomes are explicit:
+- `startTargetProducer` owns `rawJobs` closure and publishes one producer error result;
+- `startJobRouter` owns `tcpJobs` and `udpJobs` closure and publishes one router error result;
+- worker completion is signalled separately from result-channel closure;
+- worker failures are captured without blocking error-reporting goroutines;
+- `startScannerCompletion` combines producer, router, worker, context, and worker-termination evidence into one scanner-level completion result.
+
+Unsupported UDP work is no longer silently skipped. If an intended UDP port has no supported payload, the UDP worker records a worker-level failure, continues draining queued jobs so the router cannot be stranded, and returns the retained error when its job channel closes.
+
+Ordinary probe failures remain per-service outcomes rather than scan-level worker failures. Concurrency controls the number of simultaneous operations; the rate limiter controls how quickly new probes begin.
+
+##### Network Operations
+
+Socket operations require deadlines. TCP dials use the shared context. UDP cancellation is deadline-bound and monitored so cancellation is not reported as successful completion.
+
+TCP observations distinguish established connections from operational failure. A timeout alone must not be presented as proof of firewall filtering or service closure.
+
+UDP classification is protocol-dependent and more uncertain. Positive application responses are stronger evidence than silence.
+
+##### Protocol Metadata & TLS Inspection
+
+- HTTP handlers may send a bounded request to client-first services.
+- Non-fatal TLS handshakes collect negotiated version, cipher suite, validity boundaries (`NotBefore`, `NotAfter`), and certificate authority validation.
+- Handshake timeouts or validation failures retain Layer 4 `open` state and capture diagnostic hints without dropping observations.
+- Reads and banners must be size-limited to prevent buffer exhaustion. Raw server content is untrusted input and must not produce unbounded events.
+
+##### Observation Normalization
+
+Internal worker structures should not become the long-term public telemetry contract. A dedicated event model isolates lifecycle events from implementation details.
+
+Stable comparison inputs include:
+- protocol;
+- normalized IP address;
+- port;
+- service state;
+- normalized service name;
+- bounded normalized banner;
+- certificate fingerprint or selected stable certificate fields.
+
+Unstable fields must not influence observation fingerprints: scan timestamp, latency, event ID, temporary OS error text, and worker/rate/timeout settings.
+
+#### Target Lifecycle Vertical Slice
 
 **Status: implemented and verified (Phase E).**
 
@@ -103,15 +197,18 @@ flowchart LR
 
 A cancelled, failed, partial, or unresolved scan must preserve the previous committed baseline and must not generate `service.closed`.
 
-## 3.3 Implementation progress
+### 3.2 Implementation Progress Table
 
-| Workstream | Result | Status |
+| Workstream / Subsystem | Scope / Result | Status |
 | --- | --- | --- |
 | **Phase A: Repository baseline** | Input parsing, CLI validation, IPv6 safety, stdout/stderr stream separation, unit & race test suite. | Complete and verified |
 | **Phase B1-B7: Lifecycle state** | Stable identities, versioned bbolt baseline, lifecycle event NDJSON emission. | Complete and verified |
 | **Phase C1-C3: TLS & Risk** | Non-fatal TLS probes, zero-alloc LPM CIDR engine, deterministic 0–100 scoring. | Complete and verified |
 | **Phase D1-D2: Wazuh Detection** | Rules 100050–100058, `<localfile>` NDJSON pipeline, XML DOM safety. | Complete and verified |
-| **Phase E: OpenSearch Analytics** | Schema mappings, index patterns (`wazuh-alerts-*`), visual remediation analytics dashboards. | Complete, runtime-active, and verified |
+| **Phase E: OpenSearch Analytics** | Schema mappings, index patterns (`wazuh-alerts-*`), visual remediation analytics dashboards. | Complete & Verified |
+| **Phase F.1: Layer 7 Parsers** | Non-blocking SSH and HTTP parsers, `io.LimitReader` ceilings, `net.Pipe()` unit testing. | Complete & Verified |
+| **Phase F.2: Stateless UDP** | DNS/NTP/SNMP payload generation and mock socket listener testing. | Pending |
+| **Phase F.3: Pipeline Wiring** | Refactoring `worker.go` to integrate safe Layer 7 banner parsers. | Pending |
 
 The active identity chain is:
 
@@ -121,91 +218,50 @@ scope_id -> service_key -> event_id
 
 `finding_id` is deliberately deferred. It will be introduced only if one service can own multiple independent security findings rather than one lifecycle history.
 
-## 4. Major components
+## 4. Layer 7 Banner Parsing Architecture (internal/scanner/banners.go)
 
-### 4.1 Input source selection
+**Status: implemented, offline-verified, and active (Phase F.1).**
 
-Target input may originate from a positional target, local file, standard input, or an authorised remote list. Input-source selection must be explicit and mutually unambiguous.
+TcpRecon isolates protocol-specific application inspection from raw Layer 4 socket lifecycle management. Rather than coupling banner collection to physical network sockets or third-party client libraries, dedicated Layer 7 banner parsers operate purely over streaming interfaces to safely extract software identity strings from untrusted network endpoints.
 
-Required behaviour:
+### 4.1 Interface Polymorphism & Boundary Decoupling
 
-- reject multiple conflicting sources;
-- reject excessive positional arguments;
-- validate URLs before network fetching;
-- resolve hostnames without terminating the whole process on one failure;
-- preserve target identity alongside resolved addresses;
-- stream large sources instead of loading them completely into memory.
+The Layer 7 inspection functions `ParseSSH` and `ParseHTTP` accept standard `net.Conn` interfaces rather than concrete `*net.TCPConn` pointers or active dialers:
 
-### 4.2 Streaming parser
+```go
+func ParseSSH(conn net.Conn, timeout time.Duration) (string, error)
+func ParseHTTP(conn net.Conn, timeout time.Duration) (string, error)
+```
 
-The parser reads through `io.Reader` and produces scan jobs. Large individual CIDRs should eventually be expanded incrementally so producer memory remains bounded.
+This interface-polymorphic design establishes critical architectural guarantees:
 
-The parser is subject to backpressure. When work queues fill, parsing pauses until workers consume jobs.
+1. **Network Decoupling:** Parsing algorithms have zero awareness of IP addresses, ports, or underlying transport implementations. Protocol parsing is completely decoupled from socket creation.
+2. **Deterministic In-Memory Verification:** All test harnesses execute entirely offline in memory using synchronous duplex pipes (`net.Pipe()`). Mock server goroutines emulate protocol handshakes, tarpits, delays, and malformed streams without binding to host network interfaces, opening firewall ports, or requiring external connectivity.
+3. **Watchdog Deadlock Prevention:** Unit test harnesses synchronize pipe closure through explicit termination channels and watchdog timers (`time.After`), guaranteeing race-free and deadlock-free test execution.
 
-`StreamTargets` preserves these scan-level conditions:
+### 4.2 Untrusted Stream Defenses
 
-- context cancellation;
-- target parse/job-production failure;
-- target-resolution failure;
-- underlying input-reader failure, classified under the parse/production boundary;
-- `nil` when target production completes successfully.
+Remote network services are treated as hostile, untrusted input. Services may attempt Denial-of-Service attacks against reconnaissance engines via endless streams (SSH tarpits like Endlessh) or slow header drip attacks (HTTP Slowloris). TcpRecon enforces strict memory allocation ceilings and rigorous protocol validation:
 
-The producer-side send path checks `ctx.Err()` before a context-aware channel send to avoid selection races on cancellation.
+1. **Strict Allocation Bounds (`io.LimitReader`):**
+   - **SSH Parsing (`ParseSSH`):** The untrusted connection stream is wrapped in an `io.LimitReader` with a hard ceiling of 1024 bytes (`maxBannerSize = 1024`). If an SSH tarpit streams unbounded garbage bytes without a newline delimiter, the reader terminates at the byte limit and returns an explicit error (`banner exceeded max limit`) rather than exhausting scanner heap memory.
+   - **HTTP Parsing (`ParseHTTP`):** The stream is capped at 2048 bytes (`maxHTTPHeaderBytes = 2048`). Slowloris header floods or oversized responses fail closed when byte consumption exceeds the limit, immediately safeguarding memory buffers. Response bodies are discarded without reading past the header demarcation.
+2. **Protocol Validation & Sanitization:**
+   - **SSH Identification:** Parsed banners are trimmed of `\r` and `\n` characters and validated against RFC 4253 protocol specification prefix `SSH-`. Connections returning non-SSH banners (such as FTP or SMTP greetings on port 22) are rejected with `invalid protocol: not an SSH banner`.
+   - **Minimal HTTP Probe Injection:** Transmits a lightweight, RFC-compliant probe request (`GET / HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n`).
+   - **Header Extraction & Fallback:** Scans response headers line-by-line using case-insensitive token comparison for `Server:`. If the remote service omits the `Server:` header (e.g., standard API gateways or security-hardened servers), `ParseHTTP` falls back gracefully to the HTTP status line (e.g., `HTTP/1.1 403 Forbidden`), ensuring meaningful service telemetry without error drops.
 
-### 4.3 Dispatcher and worker pools
+### 4.3 Temporal Constraints
 
-The dispatcher routes jobs to protocol-specific worker pools.
+All network read and write operations are strictly bounded by temporal deadlines:
 
-- TCP workers use full-connect scanning through context-aware dials.
-- UDP workers send selected protocol-aware payloads and classify positive replies conservatively.
-- Channel direction types document ownership and prevent accidental misuse.
-- `sync.WaitGroup` and channel-closure ownership are centralised.
-- Worker counts are validated and bounded.
+1. **Pre-flight Deadline Enforcement:** Every parser immediately establishes an absolute I/O deadline via `conn.SetDeadline(time.Now().Add(timeout))` before executing any network operations.
+2. **Slowloris & Stalling Defense:** If a remote server accepts a connection but stalls data transmission (drip-feeding bytes or remaining silent), the Go network runtime aborts the operation upon deadline expiration, returning an `i/o timeout` error.
+3. **Clean Teardown:** Expired deadlines release scanner worker goroutines and prevent socket pool starvation across high-latency or adversarial network segments.
 
-Asynchronous stage outcomes are explicit:
+## 5. Storage, State & Lifecycle Reconciliation
 
-- `startTargetProducer` owns `rawJobs` closure and publishes one producer error result;
-- `startJobRouter` owns `tcpJobs` and `udpJobs` closure and publishes one router error result;
-- worker completion is signalled separately from result-channel closure;
-- worker failures are captured without blocking error-reporting goroutines;
-- `startScannerCompletion` combines producer, router, worker, context, and worker-termination evidence into one scanner-level completion result.
-
-Unsupported UDP work is no longer silently skipped. If an intended UDP port has no supported payload, the UDP worker records a worker-level failure, continues draining queued jobs so the router cannot be stranded, and returns the retained error when its job channel closes.
-
-Ordinary probe failures remain per-service outcomes rather than scan-level worker failures. Concurrency controls the number of simultaneous operations; the rate limiter controls how quickly new probes begin.
-
-### 4.4 Network operations
-
-Socket operations require deadlines. TCP dials use the shared context. UDP cancellation is deadline-bound and monitored so cancellation is not reported as successful completion.
-
-TCP observations distinguish established connections from operational failure. A timeout alone must not be presented as proof of firewall filtering or service closure.
-
-UDP classification is protocol-dependent and more uncertain. Positive application responses are stronger evidence than silence.
-
-### 4.5 Protocol metadata & TLS inspection
-
-- HTTP handlers may send a bounded request to client-first services.
-- Non-fatal TLS handshakes collect negotiated version, cipher suite, validity boundaries (`NotBefore`, `NotAfter`), and certificate authority validation.
-- Handshake timeouts or validation failures retain Layer 4 `open` state and capture diagnostic hints without dropping observations.
-- Reads and banners must be size-limited to prevent buffer exhaustion. Raw server content is untrusted input and must not produce unbounded events.
-
-### 4.6 Observation normalization
-
-Internal worker structures should not become the long-term public telemetry contract. A dedicated event model isolates lifecycle events from implementation details.
-
-Stable comparison inputs include:
-
-- protocol;
-- normalized IP address;
-- port;
-- service state;
-- normalized service name;
-- bounded normalized banner;
-- certificate fingerprint or selected stable certificate fields.
-
-Unstable fields must not influence observation fingerprints: scan timestamp, latency, event ID, temporary OS error text, and worker/rate/timeout settings.
-
-### 4.7 Stable scan-scope identity
+### 5.1 Stable scan-scope identity
 
 Status: implemented, runtime-active, and verified.
 
@@ -217,7 +273,7 @@ Status: implemented, runtime-active, and verified.
 
 Target canonicalization trims surrounding whitespace, lowercases hostnames, masks CIDRs, canonicalizes IPv4/IPv6 text through `net/netip`, and unmaps IPv4-mapped IPv6 addresses. The canonical value is serialized as JSON and hashed with SHA-256. The schema version is included in the canonical value so future identity changes can be explicit.
 
-### 4.8 Stable service identity
+### 5.2 Stable service identity
 
 Status: implemented, runtime-active, and persistently verified.
 
@@ -230,7 +286,7 @@ Status: implemented, runtime-active, and persistently verified.
 
 The canonical representation is versioned, serialized as JSON, hashed with SHA-256, and encoded as lowercase hexadecimal. Target hostname, banners, TLS metadata, service state, scan IDs, timestamps, and execution settings are strictly excluded.
 
-### 4.9 Explicit scan completion
+### 5.3 Explicit scan completion
 
 Status: implemented and verified.
 
@@ -245,7 +301,7 @@ type ScanCompletion struct {
 
 `Successful()` is intentionally strict (`Status == completed && Err == nil`). The status vocabulary includes `completed`, `cancelled`, `resolution_failed`, `parse_failed`, `worker_failed`, and `state_failed`. Missing or internally inconsistent completion evidence fails closed.
 
-### 4.10 Lifecycle state and bbolt
+### 5.4 Lifecycle state and bbolt
 
 Status: runtime-active in CLI.
 
@@ -264,13 +320,13 @@ scope/<scope_id>/scan/<scan_id>/<service_key>/...
 
 Baseline and temporary current-scan records are keyed by stable `service_key` within `scope_id`.
 
-### 4.11 Asset Enrichment & Context Mapping
+### 5.5 Asset Enrichment & Context Mapping
 
 **Status: implemented and verified.**
 
 The `internal/enrichment` package utilizes a zero-allocation Longest Prefix Match (LPM) CIDR routing table to apply local asset context (`environment`, `criticality`, `owner`) to discovered endpoints. Unmatched addresses fail securely to `"unassigned"` without allocating on the evaluation path.
 
-### 4.12 Deterministic Risk Scoring
+### 5.6 Deterministic Risk Scoring
 
 **Status: implemented and verified.**
 
@@ -281,7 +337,7 @@ The `internal/risk` package computes explainable scores natively without relying
 - Remediation Gating: `service.closed` events forcibly evaluate to score `0` and `severity: "informational"`;
 - Zero-Nested-Arrays Serialization: Multi-factor findings are encoded strictly as scalar, comma-delimited strings (`"reasons": "deprecated_tls,exposed_datastore"`).
 
-## 5. Lifecycle reconciliation
+### 5.7 Lifecycle reconciliation
 
 Status: implemented, runtime-active, and verified.
 
@@ -294,7 +350,7 @@ previous - current                         = closed
 previously closed and observed again       = reopened
 ```
 
-### 5.1 Commit rule
+#### Commit rule
 
 ```text
 ScanCompletion.Successful() == true  -> baseline promotion may proceed
@@ -303,7 +359,7 @@ ScanCompletion.Successful() == false -> baseline promotion forbidden
 
 `FinalizeCurrentScan` owns the state transition: successful scans atomically reconcile and replace the committed baseline, while incomplete scans produce no changes and attempt targeted temporary-state discard. Temporary observations from incomplete scans are discarded rather than promoted to prevent partial runs from being reported as successful remediation.
 
-### 5.2 Stable identifiers
+#### Stable identifiers
 
 | Identifier | Contract | Current status |
 | --- | --- | --- |
@@ -537,6 +593,13 @@ sudo tail -f /var/ossec/logs/alerts/alerts.json | grep "tcprecon"
 7. Confirm Wazuh decoding and expected rule matches.
 8. Confirm OpenSearch fields and dashboard visibility.
 
+### 12.5 Layer 7 Banner Parsing Verification (Phase F.1)
+
+```bash
+# In-memory table-driven unit tests for SSH and HTTP parsers
+go test -v -race -count=1 ./internal/scanner -run 'TestParse(HTTP|SSH)'
+```
+
 ## 13. Deliberate non-goals
 
 Until the vertical slice is complete, the project will not prioritize:
@@ -550,4 +613,4 @@ Until the vertical slice is complete, the project will not prioritize:
 
 ## 14. Historical evolution
 
-The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based observation suppression, and added container and Kubernetes deployment baselines. Phase B established stable scope/service identity, versioned state, and successful-scan-only baseline promotion in the CLI. Phase C introduced Layer 7 TLS inspection, LPM asset enrichment, and deterministic 0–100 risk scoring. Phase D implemented native Wazuh SIEM JSON ingestion, hierarchical detection rules (100050–100058), DOM-safe deployment scripts, and verified live alert generation in `alerts.json`. Phase E established the `wazuh-alerts-*` index pattern, enforced Doc Values aggregations to protect the 2GB JVM heap, and deployed the master TcpRecon Attack Surface Intelligence dashboard.
+The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based observation suppression, and added container and Kubernetes deployment baselines. Phase B established stable scope/service identity, versioned state, and successful-scan-only baseline promotion in the CLI. Phase C introduced Layer 7 TLS inspection, LPM asset enrichment, and deterministic 0–100 risk scoring. Phase D implemented native Wazuh SIEM JSON ingestion, hierarchical detection rules (100050–100058), DOM-safe deployment scripts, and verified live alert generation in `alerts.json`. Phase E established the `wazuh-alerts-*` index pattern, enforced Doc Values aggregations to protect the 2GB JVM heap, and deployed the master TcpRecon Attack Surface Intelligence dashboard. Phase F.1 implemented memory-bounded, offline Layer 7 banner parsers for SSH and HTTP over polymorphic `net.Conn` interfaces with comprehensive in-memory `net.Pipe()` test suites.
