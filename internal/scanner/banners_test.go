@@ -1,50 +1,49 @@
-package scanner 
+package scanner
 
 import (
-	"testing"
-	"strings"
-	"time"
 	"net"
+	"strings"
+	"testing"
+	"time"
 )
 
 type sshBannerTestCase struct {
-	name					string
-	serverAction	func(t *testing.T, s net.Conn)
-	wantBanner		string
-	wantErr				bool
-	errSubstr			string
+	name         string
+	serverAction func(t *testing.T, s net.Conn)
+	wantBanner   string
+	wantErr      bool
+	errSubstr    string
 }
 
 type httpBannerTestCase struct {
-	name 					string
-	serverAction	func(t *testing.T, s net.Conn)
-	wantBanner		string
-	wantErr				bool
-	errSubstr			string
+	name         string
+	serverAction func(t *testing.T, s net.Conn)
+	wantBanner   string
+	wantErr      bool
+	errSubstr    string
 }
 
-
 func getSSHTestCases() []sshBannerTestCase {
-	return []sshBannerTestCase {
+	return []sshBannerTestCase{
 		{
 			name: "SSH-T01: Canonical RFC 4253 banner string",
-			serverAction: func(t *testing.T, s net.Conn){
-				s.Write([]byte("SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1\r\n"))
+			serverAction: func(t *testing.T, s net.Conn) {
+				_, _ = s.Write([]byte("SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1\r\n"))
 			},
 			wantBanner: "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1",
-			wantErr: false,
+			wantErr:    false,
 		},
 		{
 			name: "SSH-T02: Endlessh tarpit buffer exhaustion",
 			serverAction: func(t *testing.T, s net.Conn) {
 				// Stream infinite garbage bytes to trigger io.LimitReader ceiling
 				for i := 0; i < 100; i++ {
-					if _ ,err := s.Write([]byte("SSH-Tarpit-Payload-Stream-Garbage-Garbage")); err != nil {
+					if _, err := s.Write([]byte("SSH-Tarpit-Payload-Stream-Garbage-Garbage")); err != nil {
 						return
 					}
 				}
 			},
-			wantErr: true,
+			wantErr:   true,
 			errSubstr: "banner exceeded max limit",
 		},
 		{
@@ -52,23 +51,23 @@ func getSSHTestCases() []sshBannerTestCase {
 			serverAction: func(t *testing.T, s net.Conn) {
 				_ = s.Close()
 			},
-			wantErr: true,
-			errSubstr:	"EOF",
+			wantErr:   true,
+			errSubstr: "EOF",
 		},
 		{
-			name:	"SSH-T04: Stalling socket",
-			serverAction:	func (t *testing.T, s net.Conn) {
+			name: "SSH-T04: Stalling socket",
+			serverAction: func(t *testing.T, s net.Conn) {
 				time.Sleep(200 * time.Millisecond)
 			},
-			wantErr: true,
-			errSubstr:	"i/o timeout",
+			wantErr:   true,
+			errSubstr: "i/o timeout",
 		},
 		{
 			name: "SSH-T05: Non-SSH service",
-			serverAction: func(t *testing.T, s net.Conn){
+			serverAction: func(t *testing.T, s net.Conn) {
 				_, _ = s.Write([]byte("220 Welcome to FTP server\r\n"))
 			},
-			wantErr:	true,
+			wantErr:   true,
 			errSubstr: "invalid protocol",
 		},
 	}
@@ -161,7 +160,7 @@ func getHTTPTestCases() []httpBannerTestCase {
 func TestParseHTTP(t *testing.T) {
 	for _, tc := range getHTTPTestCases() {
 		tc := tc
-		t.Run(tc.name, func(t *testing.T){
+		t.Run(tc.name, func(t *testing.T) {
 			clientConn, serverConn := net.Pipe()
 			defer clientConn.Close()
 
@@ -173,7 +172,7 @@ func TestParseHTTP(t *testing.T) {
 				tc.serverAction(t, serverConn)
 			}()
 
-			gotBanner, err := ParseHTTP(clientConn, 50 * time.Millisecond)
+			gotBanner, err := ParseHTTP(clientConn, 50*time.Millisecond)
 
 			_ = clientConn.Close()
 
@@ -205,7 +204,7 @@ func TestParseHTTP(t *testing.T) {
 func TestParseSSH(t *testing.T) {
 	for _, tc := range getSSHTestCases() {
 		tc := tc
-		t.Run(tc.name, func(t *testing.T){
+		t.Run(tc.name, func(t *testing.T) {
 			clientConn, serverConn := net.Pipe()
 			defer clientConn.Close()
 
@@ -221,10 +220,10 @@ func TestParseSSH(t *testing.T) {
 
 			_ = clientConn.Close()
 
-			select{
+			select {
 			case <-done:
 			case <-time.After(250 * time.Millisecond):
-				t.Fatalf("test case %q deadlocked mock server goroutine",tc.name)
+				t.Fatalf("test case %q deadlocked mock server goroutine", tc.name)
 			}
 
 			if tc.wantErr {
@@ -239,9 +238,9 @@ func TestParseSSH(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if gotBanner != tc.wantBanner{
+			if gotBanner != tc.wantBanner {
 				t.Errorf("got banner %q, want %q", gotBanner, tc.wantBanner)
-			} 
+			}
 		})
 	}
 }

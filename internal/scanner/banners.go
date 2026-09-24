@@ -1,23 +1,23 @@
 package scanner
 
 import (
-		"bufio"
-		"errors"
-		"fmt"
-		"io"
-    "net"
-		"strings"
-    "time"
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strings"
+	"time"
 )
 
 func ParseHTTP(conn net.Conn, timeout time.Duration) (string, error) {
 	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
-    return "", err
+		return "", err
 	}
 
 	probe := "GET / HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n"
 	if _, err := conn.Write([]byte(probe)); err != nil {
-    	return "", err
+		return "", err
 	}
 
 	const maxHTTPHeaderBytes = 2048
@@ -62,7 +62,7 @@ func ParseHTTP(conn net.Conn, timeout time.Duration) (string, error) {
 }
 
 func ParseSSH(conn net.Conn, timeout time.Duration) (string, error) {
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {	
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		return "", err
 	}
 	const maxBannerSize = 1024
@@ -78,7 +78,7 @@ func ParseSSH(conn net.Conn, timeout time.Duration) (string, error) {
 			if len(line) == 0 {
 				return "", err
 			}
-		}else {
+		} else {
 			return "", err
 		}
 	}
@@ -89,5 +89,5 @@ func ParseSSH(conn net.Conn, timeout time.Duration) (string, error) {
 		return "", fmt.Errorf("invalid protocol: not an SSH banner")
 	}
 
-    return banner, nil
+	return banner, nil
 }
