@@ -52,10 +52,9 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 		// L4 Succeeded. We MUST push a result for this port regardless of L7 success.
 		var banner string
 		var parseErr error
-		var meta tlsMetaData
 
 		// Step A: Attempt Opportunistic TLS Inspection
-		meta = probeTLS(conn, job.TargetName, timeout)
+		meta := probeTLS(conn, job.TargetName, timeout)
 
 		// Step B: Layer 7 Banner Dispatch
 		if meta.Version != "" {
