@@ -13,6 +13,9 @@ type tlsMetaData struct {
 	NotBefore    string
 	NotAfter     string
 	CertVerified bool
+	CertSubject  string
+	CertIssuer   string
+	SANs         []string
 }
 
 var allSupportedCipherSuites = func() []uint16 {
@@ -69,6 +72,11 @@ func probeTLS(conn net.Conn, targetName string, timeout time.Duration) tlsMetaDa
 
 	leaf := state.PeerCertificates[0]
 
+	var certIssuer string
+	if len(leaf.Issuer.Organization) > 0 {
+		certIssuer = leaf.Issuer.Organization[0]
+	}
+
 	notBefore := leaf.NotBefore.UTC().Format(time.RFC3339)
 	notAfter := leaf.NotAfter.UTC().Format(time.RFC3339)
 
@@ -87,5 +95,8 @@ func probeTLS(conn net.Conn, targetName string, timeout time.Duration) tlsMetaDa
 		NotBefore:    notBefore,
 		NotAfter:     notAfter,
 		CertVerified: verified,
+		CertSubject:  leaf.Subject.CommonName,
+		CertIssuer:   certIssuer,
+		SANs:         leaf.DNSNames,
 	}
 }

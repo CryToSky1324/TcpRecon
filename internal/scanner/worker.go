@@ -2,8 +2,8 @@ package scanner
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -50,66 +50,45 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 		}
 
 		// L4 Succeeded. We MUST push a result for this port regardless of L7 success.
-		var activeConn net.Conn = conn
-		var certSubject, certIssuer, banner string
-		var sans []string
+		var banner string
+		var parseErr error
+		var meta tlsMetaData
 
-		// 4. Layer 6: TLS Wrapping with SNI Injection
-		if job.Port == 443 || job.Port == 8443 {
-			tlsConfig := &tls.Config{
-				InsecureSkipVerify: true,
-				ServerName:         job.TargetName,
-			}
-			tlsConn := tls.Client(conn, tlsConfig)
+		// Step A: Attempt Opportunistic TLS Inspection
+		meta = probeTLS(conn, job.TargetName, timeout)
 
-			// Trap deadline failure
-			if err := tlsConn.SetDeadline(time.Now().Add(timeout)); err == nil {
-				if err := tlsConn.Handshake(); err == nil {
-					activeConn = tlsConn
-					state := tlsConn.ConnectionState()
-					if len(state.PeerCertificates) > 0 {
-						cert := state.PeerCertificates[0]
-						certSubject = cert.Subject.CommonName
-						if len(cert.Issuer.Organization) > 0 {
-							certIssuer = cert.Issuer.Organization[0]
-						}
-						sans = cert.DNSNames
-					}
-				} else if debug {
-					fmt.Fprintf(os.Stderr, "[DEBUG] TLS handshake failed for %s: %v\n", address, err)
+		// Step B: Layer 7 Banner Dispatch
+		if meta.Version != "" {
+			// TLS Handshake succeeded on this port!
+			// If it's a known HTTPS port, or default TLS, we record the TLS presence.
+			// (Note: Since probeTLS completed the handshake on 'conn', conn is now in TLS state.)
+		} else {
+			// Plaintext Stream Dispatch
+			switch job.Port {
+			case 22, 2222:
+				banner, parseErr = ParseSSH(conn, timeout)
+			case 80, 8000, 8080:
+				banner, parseErr = ParseHTTP(conn, timeout)
+			default:
+				// Safe fallback for server-first banners (FTP, SMTP, Redis, etc.)
+				_ = conn.SetReadDeadline(time.Now().Add(timeout))
+				lr := io.LimitReader(conn, 1024)
+				buf := make([]byte, 1024)
+				if n, readErr := lr.Read(buf); readErr == nil && n > 0 {
+					banner = string(buf[:n])
 				}
 			}
 		}
 
-		// 5. Layer 7: Application-Layer Payload Injection
-		// Trap WriteDeadline failure
-		if err := activeConn.SetWriteDeadline(time.Now().Add(timeout)); err == nil {
-			if job.Port == 80 || job.Port == 8080 {
-				httpReq := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", job.TargetIP)
-				// Trap payload transmission failure
-				if _, err := activeConn.Write([]byte(httpReq)); err != nil && debug {
-					fmt.Fprintf(os.Stderr, "[DEBUG] HTTP Write failed for %s: %v\n", address, err)
-				}
-			}
+		if parseErr != nil && debug {
+			fmt.Fprintf(os.Stderr, "[DEBUG] L7 parse failed for %s:%d: %v\n", job.TargetIP, job.Port, parseErr)
 		}
-
-		// 6. Buffer Allocation and Banner Extraction
-		// Trap ReadDeadline failure
-		if err := activeConn.SetReadDeadline(time.Now().Add(timeout)); err == nil {
-			buf := make([]byte, 1024)
-			// Trap Read failure (EOF or timeouts are common, don't panic)
-			if n, err := activeConn.Read(buf); err == nil && n > 0 {
-				banner = string(buf[:n])
-			}
-		}
-
-		meta := probeTLS(conn, job.TargetName, timeout)
 
 		// 7. Stateless OS Fingerprinting Execution
 		osHint := utils.FingerprintOS(banner)
 
 		// 8. Graceful Teardown and Channel Push
-		activeConn.Close()
+		conn.Close()
 		results <- models.ScanResult{
 			TargetName:    job.TargetName,
 			TargetIP:      job.TargetIP,
@@ -118,9 +97,9 @@ func Worker(ctx context.Context, jobs <-chan models.ScanJob, results chan<- mode
 			State:         "open",
 			Banner:        strings.TrimSpace(banner),
 			OSHint:        osHint,
-			CertSubject:   certSubject,
-			CertIssuer:    certIssuer,
-			SANs:          sans,
+			CertSubject:   meta.CertSubject,
+			CertIssuer:    meta.CertIssuer,
+			SANs:          meta.SANs,
 			TLSVersion:    meta.Version,
 			CipherSuite:   meta.CipherSuite,
 			CertVerified:  meta.CertVerified,
