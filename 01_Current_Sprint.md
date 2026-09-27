@@ -1,9 +1,9 @@
 # 01_Current_Sprint: Evaluation, Documentation & Offline Engineering
 
-**Updated:** 24 September 2026
+**Updated:** 27 September 2026
 **Status:** ACTIVE
 **Active branch:** `feat/phase-f-offline-probes`
-**Current workstream:** Phase F.1 complete — preparing for Phase F.2 (Stateless UDP Probes) and Worker Wiring
+**Current workstream:** Phase F.3 Part 1 complete — Active workstream: Phase F.2 (Stateless UDP Reconnaissance Engineering: DNS, NTP, SNMP)
 
 ## Sprint Goal
 
@@ -47,7 +47,7 @@ Verified work includes:
   - Verified green with zero race conditions (`go test -race -count=1 ./internal/scanner/...`).
 
 ### F.2: Stateless UDP Probes
-**Status:** READY TO INITIATE
+**Status:** ACTIVE (Stateless UDP Reconnaissance Engineering: DNS, NTP, SNMP)
 
 - [ ] Construct RFC-compliant binary payloads for stateless services:
   - DNS query payload (port 53).
@@ -56,12 +56,22 @@ Verified work includes:
 - [ ] Author mock UDP listener test harnesses using local `net.ListenUDP`.
 - [ ] Implement response byte parsers to validate protocol-specific responses versus random ICMP port unreachable replies.
 
-### F.3: Worker Dispatch Integration
-**Status:** PENDING
+### F.3: Worker Dispatch & Pipeline Integration
+**Status:** PART 1 COMPLETED (Layer 7 Worker Refactor) / PART 2 PENDING (UDP Pipeline Wiring)
 
-- [ ] Refactor `internal/scanner/worker.go` to consume `ParseHTTP` and `ParseSSH` based on target port heuristics.
-- [ ] Integrate safe bounded raw read fallback for arbitrary plaintext TCP services.
-- [ ] Wire stateless UDP payloads into `internal/scanner/udp_worker.go` with strict deadline handling.
+- [x] **Part 1 (Layer 7 Worker Refactor): COMPLETED**
+  - [x] Refactor `internal/scanner/worker.go` to consume `ParseHTTP` and `ParseSSH` based on target port heuristics.
+  - [x] Decouple opportunistic `probeTLS` executed before plaintext protocol switch, ensuring compatibility with ephemeral test listeners.
+  - [x] Integrate safe bounded raw read fallback via `io.LimitReader(conn, 1024)` active for unmapped ports.
+- [ ] **Part 2 (UDP Pipeline Wiring): PENDING**
+  - [ ] Wire stateless UDP payloads into `internal/scanner/udp_worker.go` with strict deadline handling (deferred to Phase F.2 payload construction).
+
+#### Phase F.3 Part 1 Verification Evidence
+- `worker.go` integrated with `ParseSSH` and `ParseHTTP`.
+- Decoupled opportunistic `probeTLS` executed before plaintext protocol switch, ensuring compatibility with ephemeral test listeners.
+- Bounded fallback via `io.LimitReader(conn, 1024)` active for unmapped ports.
+- Passing suite under race detector: `TestTLSInspection` (7/7 pass), `TestParseSSH` (5/5 pass), `TestParseHTTP` (6/6 pass) — all 18 scenarios PASS.
+- `golangci-lint` passing clean under S1021 (merged declaration and assignment for `meta`).
 
 ### F.4: Documentation, Benchmarks & Final Freeze
 **Status:** PENDING

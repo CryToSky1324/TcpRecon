@@ -1076,3 +1076,72 @@ No major architectural blockers occurred during assembly; the primary challenge 
 ### Evidence
 - Registered the dashboard via `/api/saved_objects/dashboard/tcprecon-attack-surface-overview?overwrite=true`.
 - Visually verified via the web UI (`https://100.124.20.59`) that the Master Dashboard successfully plots time mutations, risk binning, and cryptographic findings simultaneously without crashing the indexer node.
+
+-------------------------------------------------------------------------------------
+
+## 2026-09-27: Phase F.1 — Safe Offline Layer 7 Banner Parsers & In-Memory net.Pipe() Harnesses
+
+### Goal
+Implement memory-bounded, non-blocking Layer 7 banner parsing for SSH (RFC 4253) and HTTP (RFC 7230/9112) decoupled from live socket dialing, validated strictly offline via in-memory net.Pipe() harnesses with zero deadlocks.
+
+### Starting state
+Phase E was merged into main. The scanning worker (worker.go) performed raw, unparsed socket dumps for SSH and emitted crude HTTP GET requests coupled directly to the OS dial loop. No standalone unit tests existed for protocol extraction, and untrusted streams lacked memory ceilings against malicious tarpits (e.g., Endlessh).
+
+### Work completed
+- Authored internal/scanner/banners.go accepting polymorphic net.Conn interfaces:
+  - ParseSSH: Validates RFC 4253 protocol identification strings, strips carriage returns, rejects non-SSH protocol prefixes, and bounds reads with io.LimitReader(conn, 1024).
+  - ParseHTTP: Injects minimal probe (GET / HTTP/1.1\r\nHost: probe\r\nConnection: close\r\n\r\n), parses response lines, extracts case-insensitive Server: header values, falls back to the HTTP status line, discards message bodies, and bounds header reads with io.LimitReader(conn, 2048).
+- Scaffolded table-driven unit test suite in internal/scanner/banners_test.go utilizing in-memory net.Pipe():
+  - TestParseSSH: 5 test cases covering canonical banners, Endlessh tarpit buffer exhaustion, premature EOF, read deadline timeouts, and FTP/protocol mismatches.
+  - TestParseHTTP: 6 test cases covering canonical headers, case insensitivity, missing header fallback, slowloris header floods, premature EOF, and deadline timeouts.
+- Resolved CI/CD golangci-lint failure by explicitly checking/discarding return values on s.Write in test harnesses (errcheck).
+
+### Problems encountered
+#### The Synchronous net.Pipe() Unbuffered Deadlock Trap
+When running TestParseHTTP against empty stub functions, the test stalled indefinitely (>490s). Because net.Pipe() is unbuffered and synchronous, the mock server blocked on s.Read(buf) waiting for the client probe. When the client stub returned early without writing or closing the pipe, both goroutines deadlocked.
+Fixed by: (1) explicitly closing clientConn before awaiting the server completion channel, and (2) wrapping the goroutine wait in a select with a watchdog timer (time.After(250*time.Millisecond)).
+
+#### Delimiter Early-Exit in Tarpit Simulation (SSH-T02)
+The endless tarpit test initially failed with 'expected error, got nil' because the mock server payload contained a trailing \r\n. reader.ReadString('\n') succeeded after 43 bytes without tripping the 1024-byte ceiling.
+Fixed by: altering the mock server write loop to stream garbage bytes strictly without newlines, forcing the LimitReader to hit its boundary and trigger io.EOF.
+
+#### CI/CD errcheck Failure
+golangci-lint failed on internal/scanner/banners_test.go:32 due to an unhandled s.Write() error return. Fixed by assigning return values to blank identifiers (_, _ = s.Write(...)).
+
+### Decisions I made
+- Enforced strict interface polymorphism: parsers accept net.Conn, ensuring identical execution across production sockets and in-memory duplex pipes.
+- Enforced mandatory pre-flight conn.SetDeadline calls to eliminate hung worker goroutines on stalling endpoints.
+- Capped allocation ceilings at 1024 bytes (SSH) and 2048 bytes (HTTP) to guarantee O(1) heap allocation bounds against adversarial targets.
+
+### Evidence
+- Tests passing under race detector:
+  go test -race -count=1 -v ./internal/scanner -run 'TestParseSSH|TestParseHTTP' (11/11 subtests green)
+- Linter clean: golangci-lint run passes with zero issues.
+- Touched files:
+  - internal/scanner/banners.go
+  - internal/scanner/banners_test.go
+
+### Remaining limitations & Next step
+The core worker (internal/scanner/worker.go) still utilizes legacy inline reads. The next step is Phase F.2 (Stateless UDP Probes for DNS/NTP/SNMP) and Phase F.3 (Refactoring worker.go to wire ParseSSH and ParseHTTP into the active scan pipeline).
+
+-------------------------------------------------------------------------------------
+
+## 2026-09-27 - Phase F.3: Layer 7 Worker Integration & Opportunistic TLS Discovery
+
+### 1. Objective
+Refactor internal/scanner/worker.go to consume safe, bounded in-memory parsers (ParseSSH, ParseHTTP) from Phase F.1 while preserving single-dial stream invariants and non-fatal fallback behavior.
+
+### 2. Engineering Challenges & Resolutive Mechanics
+- Ephemeral Port Discovery Trap:
+  * Problem: Gating probeTLS strictly behind port 443/8443 caused TestTLSInspection to fail, as test fixtures bind to ephemeral kernel ports (e.g., net.Listen("tcp", "127.0.0.1:0")).
+  * Solution: Decoupled TLS evaluation by running probeTLS opportunistically on the active connection. Plaintext sockets cleanly fail non-fatally within deadline bounds and drop into the application switch.
+- Stream State Ownership & Single-Dial Invariant:
+  * Problem: Attempting a second tls.Client handshake on an already-negotiated TLS connection resulted in socket corruption and resets.
+  * Solution: Consolidated cryptographic extraction (CertSubject, CertIssuer, SANs) directly into tlsMetaData within internal/scanner/tls.go, eliminating redundant handshakes.
+- Static Analysis Compliance:
+  * Remedied gosimple (S1021) violation in worker.go by merging var meta tlsMetaData declaration directly with probeTLS assignment.
+
+### 3. Verification Evidence
+- Commands executed and passing:
+  * go test -race -v ./internal/scanner -run "TestTLSInspection|TestParseSSH|TestParseHTTP" (all 18 scenarios PASS)
+  * golangci-lint run --timeout=5m (0 issues found)
