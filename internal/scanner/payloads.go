@@ -6,10 +6,11 @@ import (
 )
 
 // UDPPayloads maps standard UDP ports to raw byte requests designed to elicit a response.
-var UDPPayloads = map[int][]byte {
+var UDPPayloads = map[int][]byte{
 	53:  BuildDNSQuery(0x1337),
 	123: BuildNTPRequest(),
-	// Keep 161 static until SNMP builder is implemented in Phase F.2	// SNMP (161): SNMPv2c GetRequest for sysDescr.0
+	// Keep 161 static until SNMP builder is implemented in Phase F.2
+	// SNMP (161): SNMPv2c GetRequest for sysDescr.0
 	161: []byte{
 		0x30, 0x26, 0x02, 0x01, 0x01, 0x04, 0x06, 0x70,
 		0x75, 0x62, 0x6c, 0x69, 0x63, 0xa0, 0x19, 0x02,
@@ -24,19 +25,19 @@ func BuildDNSQuery(txID uint16) []byte {
 	buf := make([]byte, 27)
 
 	// Header Section (12 bytes)
-	binary.BigEndian.PutUint16(buf[0:2], txID)		// Bytes 0-1: Transaction ID
-	binary.BigEndian.PutUint16(buf[2:4], 0x0100)	// Bytes 2-3: Flags (RD = 1)
-	binary.BigEndian.PutUint16(buf[4:6], 1)				// Bytes 4-5: QDCOUNT (1 question)
+	binary.BigEndian.PutUint16(buf[0:2], txID)   // Bytes 0-1: Transaction ID
+	binary.BigEndian.PutUint16(buf[2:4], 0x0100) // Bytes 2-3: Flags (RD = 1)
+	binary.BigEndian.PutUint16(buf[4:6], 1)      // Bytes 4-5: QDCOUNT (1 question)
 	// Bytes 6-11 are ANCOUNT, NSCOUNT, ARCOUNT (defaulted to 0 by make)
 
 	// Question Section - QNAME (11 bytes)
-	buf[12] = 9											// Length of first label
-	copy(buf[13:22], "localhost")		// Label string content
-	buf[22] = 0x00 									// Null terminator of QNAME
+	buf[12] = 9                   // Length of first label
+	copy(buf[13:22], "localhost") // Label string content
+	buf[22] = 0x00                // Null terminator of QNAME
 
 	// QTYPE & QCLASS (4 bytes)
-	binary.BigEndian.PutUint16(buf[23:25], 1)		// Bytes 23-24: QTYPE (Type A)
-	binary.BigEndian.PutUint16(buf[25:27], 1)		// Bytes 25-26: QCLASS (Class IN)
+	binary.BigEndian.PutUint16(buf[23:25], 1) // Bytes 23-24: QTYPE (Type A)
+	binary.BigEndian.PutUint16(buf[25:27], 1) // Bytes 25-26: QCLASS (Class IN)
 
 	return buf
 }
@@ -61,11 +62,7 @@ func ValidateDNSResponse(req, resp []byte) bool {
 
 	// Standard Opcode Preservation
 	opcode := (resp[2] >> 3) & 0x0F
-	if opcode != 0 {
-		return false
-	}
-
-	return true
+	return opcode == 0
 }
 
 func BuildNTPRequest() []byte {
