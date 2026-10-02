@@ -200,15 +200,16 @@ A cancelled, failed, partial, or unresolved scan must preserve the previous comm
 ### 3.2 Implementation Progress Table
 
 | Workstream / Subsystem | Scope / Result | Status |
-| --- | --- | --- |
+| ------ | ------ | ------ |
 | **Phase A: Repository baseline** | Input parsing, CLI validation, IPv6 safety, stdout/stderr stream separation, unit & race test suite. | Complete and verified |
 | **Phase B1-B7: Lifecycle state** | Stable identities, versioned bbolt baseline, lifecycle event NDJSON emission. | Complete and verified |
 | **Phase C1-C3: TLS & Risk** | Non-fatal TLS probes, zero-alloc LPM CIDR engine, deterministic 0–100 scoring. | Complete and verified |
-| **Phase D1-D2: Wazuh Detection** | Rules 100050–100058, `<localfile>` NDJSON pipeline, XML DOM safety. | Complete and verified |
-| **Phase E: OpenSearch Analytics** | Schema mappings, index patterns (`wazuh-alerts-*`), visual remediation analytics dashboards. | Complete & Verified |
-| **Phase F.1: Layer 7 Parsers** | Non-blocking SSH and HTTP parsers, `io.LimitReader` ceilings, `net.Pipe()` unit testing. | Complete & Verified |
-| **Phase F.2: Stateless UDP** | DNS/NTP/SNMP payload generation and mock socket listener testing. | Pending |
-| **Phase F.3: Pipeline Wiring** | Refactoring `worker.go` to integrate safe Layer 7 banner parsers. | Pending |
+| **Phase D1-D2: Wazuh Detection** | Rules 100050–100058, <localfile> NDJSON pipeline, XML DOM safety. | Complete and verified |
+| **Phase E: OpenSearch Analytics** | Schema mappings, index patterns (wazuh-alerts-*), visual remediation analytics dashboards. | Complete & Verified |
+| **Phase F.1: Layer 7 Parsers** | Non-blocking SSH and HTTP parsers, io.LimitReader ceilings, net.Pipe() unit testing. | Complete & Verified |
+| **Phase F.2: Stateless UDP** | RFC 1035 DNS & RFC 5905 NTPv4 encoders/gatekeepers, ephemeral mock socket tests. | Complete & Verified |
+| **Phase F.3: Pipeline Wiring** | UDPWorker refactored with 2048-byte fixed buffers and protocol validation gates. | Complete & Verified |
+| **Phase F.4: Docs & Benchmarks** | Benchmark verification of zero-alloc hot path validators and architecture sync. | Active / Closing |
 
 The active identity chain is:
 

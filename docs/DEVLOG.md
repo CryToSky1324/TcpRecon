@@ -1145,3 +1145,30 @@ Refactor internal/scanner/worker.go to consume safe, bounded in-memory parsers (
 - Commands executed and passing:
   * go test -race -v ./internal/scanner -run "TestTLSInspection|TestParseSSH|TestParseHTTP" (all 18 scenarios PASS)
   * golangci-lint run --timeout=5m (0 issues found)
+
+-------------------------------------------------------------------------------------
+
+## Phase F.2 & F.3: Stateless UDP Wire Probing and Protocol Gatekeepers
+
+### Goal
+Implement RFC-compliant binary wire protocols for DNS (RFC 1035) and NTPv4 (RFC 5905) from scratch without third-party dependencies, refactoring UDPWorker to validate inbound replies against dynamic correlation IDs under strict read/write deadlines.
+
+### Technical Implementation
+- **RFC 1035 DNS Query Construction & Validation:**
+  - `BuildDNSQuery(txID)` builds a deterministic 27-byte A-record query for `localhost` with recursion desired (`RD=1`).
+  - `ValidateDNSResponse(req, resp)` enforces a 12-byte header floor, validates matching 16-bit transaction IDs, asserts the QR bit (`0x80`), and verifies Opcode 0.
+- **RFC 5905 NTPv4 Construction & Validation:**
+  - `BuildNTPRequest()` generates an exact 48-byte Mode 3 (Client) datagram with byte 0 encoded as `0x23` (`LI=0, VN=4, Mode=3`).
+  - `ValidateNTPResponse(resp)` enforces the 48-byte floor, filters non-server modes (`Mode != 4 && Mode != 5`), verifies version bounds (`1 <= VN <= 4`), bounds Stratum to `<= 16`, and verifies non-zero 64-bit transmit timestamps.
+- **UDPWorker Hardening:**
+  - Standardized on 2048-byte fixed allocations (`make([]byte, 2048)`) on socket reads.
+  - Dynamically builds per-probe ephemeral DNS transaction IDs to eliminate concurrency collision.
+  - Replaced naive read-byte checks with protocol-specific validation gatekeepers.
+- **Offline Ephemeral Test Harness:**
+  - Verified against local mock UDP listeners bound to `127.0.0.1:0`.
+  - Zero heap allocations (`0 allocs/op`) verified on validation paths.
+
+### Verification
+- `go test -race -count=1 ./internal/scanner/...`: 100% PASS
+- `go vet ./...`: 0 defects
+- `git diff --check`: Clean formatting and zero trailing whitespace defects
