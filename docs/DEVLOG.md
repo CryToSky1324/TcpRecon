@@ -1172,3 +1172,34 @@ Implement RFC-compliant binary wire protocols for DNS (RFC 1035) and NTPv4 (RFC 
 - `go test -race -count=1 ./internal/scanner/...`: 100% PASS
 - `go vet ./...`: 0 defects
 - `git diff --check`: Clean formatting and zero trailing whitespace defects
+
+-------------------------------------------------------------------------------------
+
+## 2026-10-02: Phase F.2 & F.3 Stateless UDP Probing and Pipeline Hardening
+
+### Goal
+Implement RFC-compliant binary wire-format encoders and response gatekeepers for DNS (RFC 1035) and NTPv4 (RFC 5905) from scratch without third-party dependencies. Refactor `UDPWorker` to enforce strict deadlines, dynamic correlation, and fixed memory boundaries.
+
+### Challenges & Architectural Decisions
+1. **Payload Contract Alignment:**
+   - Identified a contract split-brain where a legacy static map used hardcoded transaction IDs (`0x1337`) while dynamic builders generated ephemeral IDs.
+   - Re-initialized fallback static definitions from dynamic builders to preserve a single source of truth.
+2. **Binary Deserialization Reader vs Writer:**
+   - Corrected an inverted operation in `ValidateDNSResponse` where `binary.BigEndian.PutUint16` was used instead of `binary.BigEndian.Uint16`, ensuring zero-allocation integer extraction from byte buffers.
+3. **Strict Bitfield Validation:**
+   - Implemented bitwise classification in `ValidateNTPResponse` to filter reflected Mode 3 queries and enforce Stratum (`<= 16`) and non-zero transmit timestamps.
+4. **Offline Ephemeral Socket Testing:**
+   - Validated socket round-trips exclusively via `net.ListenUDP` bound to `127.0.0.1:0`, eliminating network dependencies while preventing goroutine leaks and channel deadlocks.
+5. **Zero-Allocation Hot-Path Verification:**
+   - Authored allocation benchmarks verifying that `ValidateDNSResponse` and `ValidateNTPResponse` execute in sub-2ns with 0 B/op and 0 allocs/op.
+
+### Verification Evidence
+- `internal/scanner/payloads_test.go`: 100% PASS
+- `internal/scanner/udp_worker_test.go`: 100% PASS
+- Benchmark Results:
+  - `BenchmarkBuildDNSQuery-4`: 0.3642 ns/op, 0 B/op, 0 allocs/op
+  - `BenchmarkValidateDNSResponse-4`: 1.516 ns/op, 0 B/op, 0 allocs/op
+  - `BenchmarkBuildNTPRequest-4`: 0.3519 ns/op, 0 B/op, 0 allocs/op
+  - `BenchmarkValidateNTPResponse-4`: 1.875 ns/op, 0 B/op, 0 allocs/op
+- `go test -race -count=1 ./...`: Clean PASS
+- `go vet ./...`: 0 defects

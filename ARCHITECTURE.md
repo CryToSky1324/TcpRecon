@@ -12,7 +12,7 @@ The project is not intended to outperform or replace mature scanners. Its engine
 network observation → normalized state → asset enrichment → risk scoring → lifecycle event → detection → analysis → remediation evidence
 ```
 
-The scanner, stable identity helpers, explicit scan-completion boundary, versioned lifecycle-state subsystem, Layer 7 TLS inspection, LPM asset enrichment, deterministic risk engine, Wazuh detection pipeline (rules 100050–100058 with automated lifecycle scripts), OpenSearch remediation analytics with visual dashboards, and Phase F.1 (offline Layer 7 banner parsers for SSH and HTTP) are now runtime-active and verified. Offline UDP probe generation and worker pipeline refactoring remain the final stages of the vertical slice.
+The scanner, stable identity helpers, explicit scan-completion boundary, versioned lifecycle-state subsystem, Layer 7 TLS inspection, LPM asset enrichment, deterministic risk engine, Wazuh detection pipeline (rules 100050–100058 with automated lifecycle scripts), OpenSearch remediation analytics with visual dashboards, and Phase F (offline Layer 7 banner parsers for SSH and HTTP, stateless UDP wire reconnaissance for RFC 1035 DNS and RFC 5905 NTPv4, hardened UDP worker pipeline, and zero-allocation hot-path benchmarks) are now runtime-active, fully implemented, and verified.
 
 ## 2. Design principles
 
@@ -205,11 +205,11 @@ A cancelled, failed, partial, or unresolved scan must preserve the previous comm
 | **Phase B1-B7: Lifecycle state** | Stable identities, versioned bbolt baseline, lifecycle event NDJSON emission. | Complete and verified |
 | **Phase C1-C3: TLS & Risk** | Non-fatal TLS probes, zero-alloc LPM CIDR engine, deterministic 0–100 scoring. | Complete and verified |
 | **Phase D1-D2: Wazuh Detection** | Rules 100050–100058, <localfile> NDJSON pipeline, XML DOM safety. | Complete and verified |
-| **Phase E: OpenSearch Analytics** | Schema mappings, index patterns (wazuh-alerts-*), visual remediation analytics dashboards. | Complete & Verified |
-| **Phase F.1: Layer 7 Parsers** | Non-blocking SSH and HTTP parsers, io.LimitReader ceilings, net.Pipe() unit testing. | Complete & Verified |
-| **Phase F.2: Stateless UDP** | RFC 1035 DNS & RFC 5905 NTPv4 encoders/gatekeepers, ephemeral mock socket tests. | Complete & Verified |
-| **Phase F.3: Pipeline Wiring** | UDPWorker refactored with 2048-byte fixed buffers and protocol validation gates. | Complete & Verified |
-| **Phase F.4: Docs & Benchmarks** | Benchmark verification of zero-alloc hot path validators and architecture sync. | Active / Closing |
+| **Phase E: OpenSearch Analytics** | Schema mappings, index patterns (wazuh-alerts-*), visual remediation analytics dashboards. | Complete and verified |
+| **Phase F.1: Layer 7 Parsers** | Non-blocking SSH and HTTP parsers, io.LimitReader ceilings, net.Pipe() unit testing. | Complete and verified |
+| **Phase F.2: Stateless UDP** | RFC 1035 DNS & RFC 5905 NTPv4 binary encoders and response gatekeepers. | Complete and verified |
+| **Phase F.3: Pipeline Wiring** | UDPWorker refactored with 2048-byte fixed buffers and protocol validation gates. | Complete and verified |
+| **Phase F.4: Docs & Benchmarks** | Benchmark verification of zero-alloc hot path validators and architecture sync. | Complete and verified |
 
 The active identity chain is:
 
@@ -260,9 +260,28 @@ All network read and write operations are strictly bounded by temporal deadlines
 2. **Slowloris & Stalling Defense:** If a remote server accepts a connection but stalls data transmission (drip-feeding bytes or remaining silent), the Go network runtime aborts the operation upon deadline expiration, returning an `i/o timeout` error.
 3. **Clean Teardown:** Expired deadlines release scanner worker goroutines and prevent socket pool starvation across high-latency or adversarial network segments.
 
-## 5. Storage, State & Lifecycle Reconciliation
+## 5. Stateless UDP Reconnaissance Architecture (Phase F.2 & F.3)
 
-### 5.1 Stable scan-scope identity
+**Status: implemented and verified (Phase F)**
+
+### 5.1 Protocol-Aware Encoders and Response Gatekeepers
+Because UDP is connectionless, Layer 4 reachability cannot be confirmed by a socket handshake. The engine constructs RFC-compliant Layer 7 binary datagrams and classifies incoming frames using zero-allocation bitwise validation:
+
+1. **DNS (Port 53 - RFC 1035):**
+   - **Request (`BuildDNSQuery`):** Generates an exact 27-byte query for `localhost` (A record, Class IN) with recursion desired (`RD=1`) and a dynamic 16-bit transaction ID (`txID`).
+   - **Validation (`ValidateDNSResponse`):** Enforces a 12-byte header floor, validates matching transaction IDs (`reqID == respID`), asserts the QR response bit (`0x80`), and checks standard Opcode (`0`).
+2. **NTP (Port 123 - RFC 5905):**
+   - **Request (`BuildNTPRequest`):** Generates an exact 48-byte Mode 3 (Client) datagram with NTPv4 byte 0 encoded as `0x23` (`LI=0, VN=4, Mode=3`).
+   - **Validation (`ValidateNTPResponse`):** Enforces a 48-byte length floor, rejects client reflection queries (`Mode != 4 && Mode != 5`), verifies version bounds (`1 <= VN <= 4`), asserts Stratum (`<= 16`), and checks for a non-zero Transmit Timestamp (bytes 40–47).
+
+### 5.2 UDP Worker Pipeline & Memory Safety
+- **Fixed Memory Allocation:** Socket reads allocate a fixed 2048-byte buffer (`make([]byte, 2048)`) per read cycle to prevent unbounded memory growth.
+- **Dynamic Correlation:** Per-job transaction IDs prevent reflection collision across concurrent UDP workers.
+- **Fail-Safe Channel Draining:** Unmapped ports record a worker error and drain subsequent jobs without stalling the pipeline router.
+
+## 6. Storage, State & Lifecycle Reconciliation
+
+### 6.1 Stable scan-scope identity
 
 Status: implemented, runtime-active, and verified.
 
@@ -274,7 +293,7 @@ Status: implemented, runtime-active, and verified.
 
 Target canonicalization trims surrounding whitespace, lowercases hostnames, masks CIDRs, canonicalizes IPv4/IPv6 text through `net/netip`, and unmaps IPv4-mapped IPv6 addresses. The canonical value is serialized as JSON and hashed with SHA-256. The schema version is included in the canonical value so future identity changes can be explicit.
 
-### 5.2 Stable service identity
+### 6.2 Stable service identity
 
 Status: implemented, runtime-active, and persistently verified.
 
@@ -287,7 +306,7 @@ Status: implemented, runtime-active, and persistently verified.
 
 The canonical representation is versioned, serialized as JSON, hashed with SHA-256, and encoded as lowercase hexadecimal. Target hostname, banners, TLS metadata, service state, scan IDs, timestamps, and execution settings are strictly excluded.
 
-### 5.3 Explicit scan completion
+### 6.3 Explicit scan completion
 
 Status: implemented and verified.
 
@@ -302,7 +321,7 @@ type ScanCompletion struct {
 
 `Successful()` is intentionally strict (`Status == completed && Err == nil`). The status vocabulary includes `completed`, `cancelled`, `resolution_failed`, `parse_failed`, `worker_failed`, and `state_failed`. Missing or internally inconsistent completion evidence fails closed.
 
-### 5.4 Lifecycle state and bbolt
+### 6.4 Lifecycle state and bbolt
 
 Status: runtime-active in CLI.
 
@@ -321,13 +340,13 @@ scope/<scope_id>/scan/<scan_id>/<service_key>/...
 
 Baseline and temporary current-scan records are keyed by stable `service_key` within `scope_id`.
 
-### 5.5 Asset Enrichment & Context Mapping
+### 6.5 Asset Enrichment & Context Mapping
 
 **Status: implemented and verified.**
 
 The `internal/enrichment` package utilizes a zero-allocation Longest Prefix Match (LPM) CIDR routing table to apply local asset context (`environment`, `criticality`, `owner`) to discovered endpoints. Unmatched addresses fail securely to `"unassigned"` without allocating on the evaluation path.
 
-### 5.6 Deterministic Risk Scoring
+### 6.6 Deterministic Risk Scoring
 
 **Status: implemented and verified.**
 
@@ -338,7 +357,7 @@ The `internal/risk` package computes explainable scores natively without relying
 - Remediation Gating: `service.closed` events forcibly evaluate to score `0` and `severity: "informational"`;
 - Zero-Nested-Arrays Serialization: Multi-factor findings are encoded strictly as scalar, comma-delimited strings (`"reasons": "deprecated_tls,exposed_datastore"`).
 
-### 5.7 Lifecycle reconciliation
+### 6.7 Lifecycle reconciliation
 
 Status: implemented, runtime-active, and verified.
 
@@ -372,7 +391,7 @@ ScanCompletion.Successful() == false -> baseline promotion forbidden
 
 The active identity chain is `scope_id -> service_key -> event_id`.
 
-## 6. Event pipeline
+## 7. Event pipeline
 
 Status: implemented and verified.
 
@@ -392,7 +411,7 @@ Canonical lifecycle vocabulary:
 
 The event envelope rigidly forbids nested arrays to maintain explicit parsing compatibility with Wazuh's `analysisd` decoder.
 
-## 7. Wazuh integration
+## 8. Wazuh integration
 
 **Status: implemented, verified, and operational on manager.**
 
@@ -424,7 +443,7 @@ deployments/wazuh/
     └── uninstall-rules.sh
 ```
 
-### 7.1 Rule hierarchy (`tcprecon_rules.xml`)
+### 8.1 Rule hierarchy (`tcprecon_rules.xml`)
 
 1. **Rule 100050 (Level 0):** Base JSON anchor matching parent Suricata rule `86600` and asserting `data.scanner.name == "tcprecon"`.
 2. **Rule 100051 (Level 3):** Matches `data.event_type == "service.opened"`.
@@ -436,16 +455,16 @@ deployments/wazuh/
 8. **Rule 100057 (Level 12):** Evaluates `data.risk.score` in `[70, 100]` (critical security finding).
 9. **Rule 100058 (Level 10):** Cryptographic violation trigger evaluating `data.risk.reasons` via PCRE2 patterns (`\bdeprecated_tls\b`, `\buntrusted_cert\b`).
 
-### 7.2 Deployment automation (`scripts/`)
+### 8.2 Deployment automation (`scripts/`)
 
 - `install-rules.sh`: Shell installer supporting portable relative paths. Stages rules, prepares `/var/log/tcprecon/events.ndjson` with `wazuh:wazuh` ownership, injects the `<localfile>` stanza, gates reloads behind `/var/ossec/bin/wazuh-analysisd -t`, and restarts `wazuh-manager`.
 - `uninstall-rules.sh`: Safe uninstallation script using Python's `xml.etree.ElementTree` DOM parser to cleanly excise the `<localfile>` entry without regex truncation, validates syntax, and restarts `wazuh-manager`.
 
-## 8. OpenSearch Analytics Architecture (Phase E)
+## 9. OpenSearch Analytics Architecture (Phase E)
 
 **Status: implemented and operational on indexer and dashboards (Phase E verified).**
 
-### 8.1 Index Template Overlay Pattern
+### 9.1 Index Template Overlay Pattern
 
 To enforce strict schema typing on TcpRecon telemetry without modifying vendor-managed Wazuh templates (`wazuh`, running at `order: 0`), an overlay index template is registered:
 
@@ -454,7 +473,7 @@ To enforce strict schema typing on TcpRecon telemetry without modifying vendor-m
 * **Precedence:** `order: 10` (overrides base settings while merging unmapped fields)
 * **File Location:** `deployments/wazuh/templates/tcprecon-alerts-template.json`
 
-### 8.2 Strict Schema Mapping Invariants
+### 9.2 Strict Schema Mapping Invariants
 
 The overlay explicitly establishes Doc Values-backed types to guarantee high-performance aggregations without JVM FieldData memory exhaustion:
 
@@ -469,14 +488,14 @@ The overlay explicitly establishes Doc Values-backed types to guarantee high-per
 | `data.asset.criticality`| `keyword` | Asset impact aggregation. |
 | `data.risk.reasons` | `keyword` | Delimited token filtering without analyzed full-text overhead. |
 
-### 8.3 JVM Heap & Lucene Shard Sizing Constraints
+### 9.3 JVM Heap & Lucene Shard Sizing Constraints
 
 To operate reliably on resource-constrained single-node hardware pinned to a 2GB JVM heap (`-Xms2g -Xmx2g`):
 * **Single Shard Pinning:** `settings.index.number_of_shards: 1` is strictly enforced via the template overlay.
 * **Heap Protection:** Mitigates Lucene term dictionary fragmentation and cluster state memory inflation across daily rolling indices.
 * **Doc Values Invariant:** Visualizations and queries must exclusively target `keyword`, `integer`, `ip`, and `date` types backed by on-disk Doc Values, eliminating Lucene in-memory un-inversion. Root queries enforce `"size": 0`.
 
-### 8.4 Visual Remediation Analytics Lenses & Master Dashboard
+### 9.4 Visual Remediation Analytics Lenses & Master Dashboard
 
 Visual analytics are codified as OpenSearch Dashboards Saved Objects under `deployments/wazuh/dashboards/`:
 
@@ -485,9 +504,9 @@ Visual analytics are codified as OpenSearch Dashboards Saved Objects under `depl
 3. **Lens 3 — High-Risk Cryptographic Findings (`lens3-crypto-findings.json`):** Terms-aggregated data table tracking `data.asset.hostname` and `data.network.port` matching Rule `100058` or `*deprecated_tls*`, sorted by `max(data.risk.score)`.
 4. **Master Dashboard (`tcprecon-attack-surface-overview.json`):** Unified "Attack Surface Intelligence" master dashboard combining all three lenses in a 48-unit responsive grid layout, referencing persistent saved objects without dynamic un-versioned UI dependencies.
 
-## 9. Deployment architecture
+## 10. Deployment architecture
 
-### 9.1 Container
+### 10.1 Container
 
 Status: repository baseline exists; current runtime verification should be recorded separately.
 
@@ -500,7 +519,7 @@ The intended container uses a multi-stage build and a minimal runtime:
 - read-only root filesystem where possible;
 - all Linux capabilities dropped.
 
-### 9.2 Kubernetes
+### 10.2 Kubernetes
 
 Status: repository baseline exists; lifecycle safety is not complete.
 
@@ -514,7 +533,7 @@ Scheduled execution uses a CronJob with:
 
 bbolt's exclusive file lock makes overlapping writers invalid by design.
 
-### 9.3 Wazuh lab baseline
+### 10.3 Wazuh lab baseline
 
 **Status: operational on Ubuntu Server 24.04 LTS host.**
 
@@ -524,7 +543,7 @@ The lab baseline host operates under resource-constrained settings:
 - **Indexer Heap:** OpenSearch / `wazuh-indexer` JVM heap pinned to `-Xms2g -Xmx2g` in `/etc/wazuh-indexer/jvm.options`;
 - **Systemd Overrides:** `TimeoutStartSec=900` applied to `wazuh-indexer` to prevent startup SIGTERM timeouts during shard recovery.
 
-## 10. CI/CD and GitOps
+## 11. CI/CD and GitOps
 
 Pull requests and pushes should verify:
 
@@ -539,7 +558,7 @@ go build ./cmd/tcprecon
 
 Release automation may build immutable OCI images. Generated binaries, credentials, local state databases, certificates, and password archives must not be committed.
 
-## 11. Security boundaries
+## 12. Security boundaries
 
 - The scanner operates only within explicit authorised scope.
 - Remote target lists are untrusted input and require HTTPS, size limits, timeouts, and validation.
@@ -548,9 +567,9 @@ Release automation may build immutable OCI images. Generated binaries, credentia
 - Rate limiting protects local and target resources; it is not an evasion mechanism.
 - Telemetry integrity matters because mixed stdout can corrupt downstream detection.
 
-## 12. Verification strategy
+## 13. Verification strategy
 
-### 12.1 Verified identity foundations
+### 13.1 Verified identity foundations
 
 ```bash
 go test -count=1 ./internal/scanner -run ScanScope
@@ -560,7 +579,7 @@ go vet ./internal/scanner
 git diff --check
 ```
 
-### 12.2 Lifecycle & risk verification
+### 13.2 Lifecycle & risk verification
 
 ```bash
 go test -v -race -count=1 ./internal/enrichment/...
@@ -568,7 +587,7 @@ go test -v -race -count=1 ./internal/risk/...
 go test -v -race -count=1 ./internal/scanner -run TestLifecycleEvents
 ```
 
-### 12.3 SIEM detection engine verification
+### 13.3 SIEM detection engine verification
 
 ```bash
 # Configuration syntax validation
@@ -583,7 +602,7 @@ sudo /var/ossec/bin/wazuh-analysisd -t
 sudo tail -f /var/ossec/logs/alerts/alerts.json | grep "tcprecon"
 ```
 
-### 12.4 Target end-to-end lab test
+### 13.4 Target end-to-end lab test
 
 1. Start an authorised lab service.
 2. Complete a scan and emit `service.opened`.
@@ -594,14 +613,24 @@ sudo tail -f /var/ossec/logs/alerts/alerts.json | grep "tcprecon"
 7. Confirm Wazuh decoding and expected rule matches.
 8. Confirm OpenSearch fields and dashboard visibility.
 
-### 12.5 Layer 7 Banner Parsing Verification (Phase F.1)
+### 13.5 Layer 7 Banner Parsing Verification (Phase F.1)
 
 ```bash
 # In-memory table-driven unit tests for SSH and HTTP parsers
 go test -v -race -count=1 ./internal/scanner -run 'TestParse(HTTP|SSH)'
 ```
 
-## 13. Deliberate non-goals
+### 13.6 Stateless UDP Wire Probing and Allocation Benchmarks (Phase F.2–F.4)
+
+```bash
+# Offline UDP mock socket tests with race detector
+go test -v -race -count=1 ./internal/scanner -run 'TestUDPWorker|TestValidate'
+
+# Hot-path binary validation and encoding benchmarks
+go test -v -bench=. -benchmem -run=^$ ./internal/scanner
+```
+
+## 14. Deliberate non-goals
 
 Until the vertical slice is complete, the project will not prioritize:
 
@@ -612,6 +641,6 @@ Until the vertical slice is complete, the project will not prioritize:
 - complex multi-tenant dashboards;
 - performance claims without reproducible benchmarks.
 
-## 14. Historical evolution
+## 15. Historical evolution
 
-The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based observation suppression, and added container and Kubernetes deployment baselines. Phase B established stable scope/service identity, versioned state, and successful-scan-only baseline promotion in the CLI. Phase C introduced Layer 7 TLS inspection, LPM asset enrichment, and deterministic 0–100 risk scoring. Phase D implemented native Wazuh SIEM JSON ingestion, hierarchical detection rules (100050–100058), DOM-safe deployment scripts, and verified live alert generation in `alerts.json`. Phase E established the `wazuh-alerts-*` index pattern, enforced Doc Values aggregations to protect the 2GB JVM heap, and deployed the master TcpRecon Attack Surface Intelligence dashboard. Phase F.1 implemented memory-bounded, offline Layer 7 banner parsers for SSH and HTTP over polymorphic `net.Conn` interfaces with comprehensive in-memory `net.Pipe()` test suites.
+The project began as a Python `socket` prototype, moved to Go worker pools, added application-layer and TLS metadata, introduced rate limiting and cancellation, separated telemetry from diagnostics, adopted bbolt-based observation suppression, and added container and Kubernetes deployment baselines. Phase B established stable scope/service identity, versioned state, and successful-scan-only baseline promotion in the CLI. Phase C introduced Layer 7 TLS inspection, LPM asset enrichment, and deterministic 0–100 risk scoring. Phase D implemented native Wazuh SIEM JSON ingestion, hierarchical detection rules (100050–100058), DOM-safe deployment scripts, and verified live alert generation in `alerts.json`. Phase E established the `wazuh-alerts-*` index pattern, enforced Doc Values aggregations to protect the 2GB JVM heap, and deployed the master TcpRecon Attack Surface Intelligence dashboard. Phase F.1 implemented memory-bounded, offline Layer 7 banner parsers for SSH and HTTP over polymorphic `net.Conn` interfaces with comprehensive in-memory `net.Pipe()` test suites. Phase F.2 through F.4 implemented RFC 1035 DNS and RFC 5905 NTPv4 wire encoders and gatekeepers, hardened the `UDPWorker` pipeline with 2048-byte fixed allocations and unmapped port draining, verified offline mock listeners on `127.0.0.1:0`, and proved sub-2ns, zero-allocation hot paths across all binary validators.
